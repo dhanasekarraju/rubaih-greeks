@@ -270,7 +270,8 @@ What is your decision?"""
         # 2) NVIDIA fallback
         nvidia_text = await self._call_nvidia(messages)
         if nvidia_text:
-            decision = self._parse_decision(nvidia_text, f"nvidia/{NVIDIA_MODEL}")
+            label = NVIDIA_MODEL if NVIDIA_MODEL.startswith("nvidia/") else f"nvidia/{NVIDIA_MODEL}"
+            decision = self._parse_decision(nvidia_text, label)
             if decision:
                 return decision
 

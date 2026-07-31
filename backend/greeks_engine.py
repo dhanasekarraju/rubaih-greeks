@@ -159,9 +159,11 @@ class OptionsCycle:
 
     def momentum(self, underlying: str) -> float:
         hist = self._spot_hist.get(underlying.upper()) or []
-        if len(hist) < max(5, self.lookback // 2):
+        need = max(5, self.lookback // 2)
+        if len(hist) < need:
             return 0.0
-        a, b = hist[-self.lookback], hist[-1]
+        n = min(self.lookback, len(hist))
+        a, b = hist[-n], hist[-1]
         if a <= 0:
             return 0.0
         return (b - a) / a
@@ -817,7 +819,7 @@ class GreeksEngine:
                         )
                 await self._publish()
             except Exception as e:
-                print(f"[MAIN] {e}")
+                print(f"[MAIN] {type(e).__name__}: {e}")
             await asyncio.sleep(3)
 
     async def sync_loop(self):
