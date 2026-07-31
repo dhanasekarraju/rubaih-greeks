@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View, Text, StyleSheet, ScrollView, TouchableOpacity,
-  SafeAreaView, RefreshControl, StatusBar, Alert, TextInput, Switch,
+  SafeAreaView, RefreshControl, StatusBar, Alert, TextInput,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { DEFAULT_API_HOST, DEFAULT_API_TOKEN, buildUrls } from './config';
@@ -18,11 +18,15 @@ const C = {
   accentDim: 'rgba(61,214,198,0.14)',
   good: '#1db954',
   bad: '#e74c3c',
+  info: '#5b9fd4',
   inputBg: '#0f1724',
+  logBg: '#080e18',
 };
 
 const TABS = [
   { id: 'dashboard', label: 'Home' },
+  { id: 'logs', label: 'Logs' },
+  { id: 'signals', label: 'Signals' },
   { id: 'trades', label: 'Trades' },
   { id: 'settings', label: 'Setup' },
 ];
@@ -32,6 +36,11 @@ function fmt(n, d = 2) {
   return Number(n).toFixed(d);
 }
 
+function confPct(n) {
+  if (n == null || Number.isNaN(Number(n))) return '—';
+  return `${(Number(n) * 100).toFixed(0)}%`;
+}
+
 export default function App() {
   const [ready, setReady] = useState(false);
   const [hostInput, setHostInput] = useState(DEFAULT_API_HOST);
@@ -39,7 +48,10 @@ export default function App() {
   const [conn, setConn] = useState(() => buildUrls(DEFAULT_API_HOST, DEFAULT_API_TOKEN));
   const [dashboard, setDashboard] = useState(null);
   const [settings, setSettings] = useState(null);
+  const [balance, setBalance] = useState(null);
   const [trades, setTrades] = useState([]);
+  const [logs, setLogs] = useState([]);
+  const [signals, setSignals] = useState([]);
   const [connected, setConnected] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [activeTab, setActiveTab] = useState('settings');
@@ -86,15 +98,21 @@ export default function App() {
     if (!c.configured) return;
     setRefreshing(true);
     try {
-      const [dash, set, tr] = await Promise.all([
+      const [dash, set, tr, bal, lg, sig] = await Promise.all([
         apiFetch('/dashboard'),
         apiFetch('/settings'),
         apiFetch('/trades?limit=30'),
+        apiFetch('/balance'),
+        apiFetch('/logs?limit=100'),
+        apiFetch('/signals?limit=40'),
       ]);
       if (!aliveRef.current) return;
       setDashboard(dash);
       setSettings(set);
       setTrades(Array.isArray(tr) ? tr : []);
+      setBalance(bal);
+      setLogs(Array.isArray(lg) ? lg : []);
+      setSignals(Array.isArray(sig) ? sig : []);
       setConnected(true);
     } catch (e) {
       setConnected(false);
@@ -125,7 +143,22 @@ export default function App() {
       ws.onmessage = (ev) => {
         try {
           const data = JSON.parse(ev.data);
-          setDashboard((prev) => ({ ...(prev || {}), ...data }));
+          if (data.channel === 'greeks:log' && data.data?.line) {
+            setLogs((prev) => [{ ts: data.data.ts, line: data.data.line }, ...prev].slice(0, 120));
+            return;
+          }
+          if (data.channel === 'greeks:signal' && data.data) {
+            setSignals((prev) => [data.data, ...prev].slice(0, 50));
+            setDashboard((prev) => ({
+              ...(prev || {}),
+              ai_last_action: data.data.action,
+              ai_confidence: data.data.confidence,
+            }));
+            return;
+          }
+          if (!data.channel) {
+            setDashboard((prev) => ({ ...(prev || {}), ...data }));
+          }
         } catch (_) {}
       };
     } catch (e) {
@@ -150,6 +183,16 @@ export default function App() {
       }
     } finally {
       setSaving(false);
+    }
+  };
+
+  const refreshWallet = async () => {
+    try {
+      await apiFetch('/refresh-capital', { method: 'POST' });
+      Alert.alert('Queued', 'Fetching live Delta wallet…');
+      setTimeout(refresh, 2500);
+    } catch (e) {
+      Alert.alert('Failed', String(e.message || e));
     }
   };
 
@@ -181,7 +224,11 @@ export default function App() {
   }
 
   const pos = dashboard?.position;
-  const live = String(dashboard?.live_trading ?? settings?.live_trading ?? 'false') === 'true';
+  const live = String(dashboard?.live_trading ?? settings?.live_trading ?? 'false') === 'true'
+    || dashboard?.live === true;
+  const free = balance?.free_capital ?? dashboard?.free_capital_inr ?? settings?.free_capital_inr;
+  const source = balance?.source || dashboard?.capital_source || settings?.capital_source || '—';
+  const walletRows = Array.isArray(balance?.balances) ? balance.balances : [];
 
   return (
     <SafeAreaView style={styles.root}>
@@ -199,18 +246,51 @@ export default function App() {
       </View>
 
       <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        style={styles.tabScroll}
+        contentContainerStyle={styles.tabRow}
+      >
+        {TABS.map((t) => (
+          <TouchableOpacity
+            key={t.id}
+            style={[styles.tabChip, activeTab === t.id && styles.tabChipOn]}
+            onPress={() => setActiveTab(t.id)}
+          >
+            <Text style={[styles.tabChipText, activeTab === t.id && styles.tabChipTextOn]}>{t.label}</Text>
+          </TouchableOpacity>
+        ))}
+      </ScrollView>
+
+      <ScrollView
         style={{ flex: 1 }}
-        contentContainerStyle={{ padding: 16, paddingBottom: 100 }}
+        contentContainerStyle={{ padding: 16, paddingBottom: 40 }}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={refresh} tintColor={C.accent} />}
       >
         {activeTab === 'dashboard' && (
           <>
             <View style={styles.card}>
-              <Text style={styles.cardTitle}>Capital</Text>
-              <Row label="Free (quote)" value={fmt(dashboard?.free_capital_inr ?? settings?.free_capital_inr)} />
+              <Text style={styles.cardTitle}>Live account balance</Text>
+              <Row label="Free (cycle)" value={fmt(free)} />
               <Row label="Budget" value={fmt(dashboard?.budget_inr)} />
+              <Row label="Source" value={String(source)} />
               <Row label="Session PnL" value={fmt(dashboard?.session_pnl)} />
               <Row label="Engine" value={String(dashboard?.engine_status || '—')} />
+              {walletRows.length > 0 && (
+                <View style={{ marginTop: 8 }}>
+                  <Text style={styles.help}>Delta wallet</Text>
+                  {walletRows.map((b) => (
+                    <Row
+                      key={b.asset}
+                      label={b.asset}
+                      value={`${fmt(b.available)} avail / ${fmt(b.balance)} total`}
+                    />
+                  ))}
+                </View>
+              )}
+              <TouchableOpacity style={styles.secondaryBtn} onPress={refreshWallet}>
+                <Text style={styles.secondaryText}>Refresh from Delta</Text>
+              </TouchableOpacity>
             </View>
 
             <View style={styles.card}>
@@ -231,19 +311,64 @@ export default function App() {
             </View>
 
             <View style={styles.card}>
+              <Text style={styles.cardTitle}>AI / confidence</Text>
+              <Row label="Last action" value={String(dashboard?.ai_last_action || '—')} />
+              <Row label="Last conf" value={confPct(dashboard?.ai_confidence)} />
+              <Row label="EMERGENCY gate" value="> 95%" />
+              <Text style={styles.help}>
+                ENTER/EXIT are advisory only. Quant owns entries/exits. AI can force flatten only on EMERGENCY with confidence above 0.95.
+              </Text>
+            </View>
+
+            <View style={styles.card}>
               <Text style={styles.cardTitle}>Exits</Text>
               <Row label="Take profit" value={settings?.tp_display || 'Premium +25%'} />
               <Row label="Stop loss" value={settings?.sl_display || 'Premium −12%'} />
               <Row label="Underlyings" value={settings?.underlyings || 'BTC,ETH'} />
-              <Text style={styles.help}>
-                Day-1: keep dry-run. Quant owns entries/exits; AI is advisory only.
-              </Text>
             </View>
 
             <TouchableOpacity style={styles.dangerBtn} onPress={kill}>
               <Text style={styles.dangerText}>Kill switch</Text>
             </TouchableOpacity>
           </>
+        )}
+
+        {activeTab === 'logs' && (
+          <View style={[styles.card, { backgroundColor: C.logBg }]}>
+            <Text style={styles.cardTitle}>Live engine logs</Text>
+            {logs.length === 0 ? (
+              <Text style={styles.help}>No logs yet — wait for SCAN / CAPITAL / SIGNAL lines</Text>
+            ) : (
+              logs.map((l, i) => (
+                <Text key={`${l.ts || i}-${i}`} style={styles.logLine} selectable>
+                  {l.line}
+                </Text>
+              ))
+            )}
+          </View>
+        )}
+
+        {activeTab === 'signals' && (
+          <View style={styles.card}>
+            <Text style={styles.cardTitle}>AI signals</Text>
+            <Text style={styles.help}>
+              Confidence gate for EMERGENCY: 95%. Lower-conf ENTER/EXIT do not override the cycle.
+            </Text>
+            {signals.length === 0 ? (
+              <Text style={styles.help}>No AI decisions yet</Text>
+            ) : (
+              signals.map((s, i) => (
+                <View key={`${s.id || s.ts || i}`} style={styles.signalRow}>
+                  <View style={styles.signalHead}>
+                    <Text style={styles.signalAction}>{s.action || '—'}</Text>
+                    <Text style={styles.signalConf}>{confPct(s.confidence)}</Text>
+                  </View>
+                  <Text style={styles.help}>{s.model || ''} · {s.risk_assessment || ''}</Text>
+                  <Text style={styles.signalReason}>{s.reasoning || ''}</Text>
+                </View>
+              ))
+            )}
+          </View>
         )}
 
         {activeTab === 'trades' && (
@@ -293,19 +418,11 @@ export default function App() {
               <Text style={styles.primaryText}>{saving ? 'Saving…' : 'Save & connect'}</Text>
             </TouchableOpacity>
             <Text style={styles.help}>
-              Same VPS as futures Rubaih. Greeks uses port 8088; futures uses 8080.
+              Same VPS as futures Rubaih. Greeks uses port 8088; futures uses 8080. Teal icon = Greeks.
             </Text>
           </View>
         )}
       </ScrollView>
-
-      <View style={styles.tabs}>
-        {TABS.map((t) => (
-          <TouchableOpacity key={t.id} style={styles.tab} onPress={() => setActiveTab(t.id)}>
-            <Text style={[styles.tabText, activeTab === t.id && styles.tabActive]}>{t.label}</Text>
-          </TouchableOpacity>
-        ))}
-      </View>
     </SafeAreaView>
   );
 }
@@ -322,13 +439,22 @@ function Row({ label, value }) {
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: C.bg },
   header: {
-    paddingHorizontal: 16, paddingTop: 8, paddingBottom: 12,
+    paddingHorizontal: 16, paddingTop: 8, paddingBottom: 8,
     flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
     borderBottomWidth: 1, borderBottomColor: C.border,
   },
   brand: { color: C.text, fontSize: 22, fontWeight: '800', letterSpacing: 0.3 },
   sub: { color: C.muted, marginTop: 2, fontSize: 12 },
   pill: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999 },
+  tabScroll: { maxHeight: 48, borderBottomWidth: 1, borderBottomColor: C.border },
+  tabRow: { paddingHorizontal: 12, paddingVertical: 8, gap: 8 },
+  tabChip: {
+    paddingHorizontal: 14, paddingVertical: 8, borderRadius: 10,
+    backgroundColor: C.card, borderWidth: 1, borderColor: C.border, marginRight: 8,
+  },
+  tabChipOn: { backgroundColor: C.accentDim, borderColor: C.accent },
+  tabChipText: { color: C.muted, fontWeight: '600', fontSize: 13 },
+  tabChipTextOn: { color: C.accent },
   card: {
     backgroundColor: C.card, borderColor: C.border, borderWidth: 1,
     borderRadius: 14, padding: 14, marginBottom: 12,
@@ -347,6 +473,11 @@ const styles = StyleSheet.create({
     marginTop: 14, backgroundColor: C.accent, borderRadius: 12, paddingVertical: 12, alignItems: 'center',
   },
   primaryText: { color: '#04221f', fontWeight: '800' },
+  secondaryBtn: {
+    marginTop: 12, borderColor: C.accent, borderWidth: 1, borderRadius: 12,
+    paddingVertical: 11, alignItems: 'center',
+  },
+  secondaryText: { color: C.accent, fontWeight: '700' },
   dangerBtn: {
     backgroundColor: 'rgba(231,76,60,0.15)', borderColor: C.bad, borderWidth: 1,
     borderRadius: 12, paddingVertical: 14, alignItems: 'center', marginTop: 4,
@@ -354,12 +485,13 @@ const styles = StyleSheet.create({
   dangerText: { color: C.bad, fontWeight: '800' },
   tradeRow: { paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: C.border },
   tradeMain: { color: C.text, fontWeight: '700', marginBottom: 2 },
-  tabs: {
-    position: 'absolute', left: 0, right: 0, bottom: 0,
-    flexDirection: 'row', backgroundColor: C.card, borderTopWidth: 1, borderTopColor: C.border,
-    paddingBottom: 10, paddingTop: 8,
+  logLine: {
+    color: '#b7c4d4', fontSize: 11, fontFamily: 'monospace', lineHeight: 16,
+    marginBottom: 6,
   },
-  tab: { flex: 1, alignItems: 'center', paddingVertical: 8 },
-  tabText: { color: C.muted, fontWeight: '600' },
-  tabActive: { color: C.accent },
+  signalRow: { paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: C.border },
+  signalHead: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 4 },
+  signalAction: { color: C.accent, fontWeight: '800', fontSize: 14 },
+  signalConf: { color: C.info, fontWeight: '700' },
+  signalReason: { color: C.text, fontSize: 13, marginTop: 4, lineHeight: 18 },
 });

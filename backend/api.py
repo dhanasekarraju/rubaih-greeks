@@ -114,6 +114,7 @@ async def settings():
         "underlyings": ",".join(t.get("underlyings") or ["BTC", "ETH"]),
         "capital_inr": str(t.get("capital_inr", 1000)),
         "free_capital_inr": free,
+        "capital_source": stored.get("capital_source", "unknown"),
         "margin_use_frac": str(t.get("margin_use_frac", 0.55)),
         "margin_use_max_frac": str(t.get("margin_use_max_frac", 0.60)),
         "take_profit_premium_pct": str(s.get("take_profit_premium_pct", 0.25)),
@@ -124,6 +125,8 @@ async def settings():
         "min_dte_days": str(s.get("min_dte_days", 1)),
         "max_dte_days": str(s.get("max_dte_days", 7)),
         "allow_sell_premium": str(bool(t.get("allow_sell_premium", False))).lower(),
+        "ai_emergency_conf": "0.95",
+        "ai_note": "ENTER/EXIT advisory only; EMERGENCY acts only if confidence > 0.95",
         **stored,
     }
 
@@ -138,6 +141,76 @@ async def trades(limit: int = Query(default=30, ge=1, le=200)):
     return [dict(r) for r in rows]
 
 
+@app.get("/api/logs", dependencies=[Depends(require_token)])
+async def get_logs(limit: int = Query(default=100, ge=1, le=200)):
+    if not rd:
+        return []
+    rows = await rd.lrange("greeks:logs", 0, limit - 1)
+    out = []
+    for r in rows:
+        try:
+            out.append(json.loads(r))
+        except Exception:
+            out.append({"ts": None, "line": str(r)})
+    return out
+
+
+@app.get("/api/signals", dependencies=[Depends(require_token)])
+async def get_signals(limit: int = Query(default=40, ge=1, le=100)):
+    """AI decisions (signals) for the mobile Signals tab."""
+    if pg_pool:
+        rows = await pg_pool.fetch(
+            "SELECT * FROM ai_decisions ORDER BY timestamp DESC LIMIT $1", limit
+        )
+        if rows:
+            return [
+                {
+                    "id": r["id"],
+                    "ts": r["timestamp"].isoformat() if r["timestamp"] else None,
+                    "model": r["model"],
+                    "action": r["action"],
+                    "confidence": float(r["confidence"]) if r["confidence"] is not None else None,
+                    "reasoning": r["reasoning"],
+                    "risk_assessment": r["risk_assessment"],
+                }
+                for r in rows
+            ]
+    if not rd:
+        return []
+    rows = await rd.lrange("greeks:signals", 0, limit - 1)
+    out = []
+    for r in rows:
+        try:
+            out.append(json.loads(r))
+        except Exception:
+            pass
+    return out
+
+
+@app.get("/api/balance", dependencies=[Depends(require_token)])
+async def get_balance():
+    """Live Delta wallet snapshot + free capital used by the cycle."""
+    wallet = {}
+    if rd:
+        raw = await rd.get("greeks:wallet")
+        if raw:
+            try:
+                wallet = json.loads(raw)
+            except Exception:
+                wallet = {}
+        settings = await rd.hgetall("greeks:settings") or {}
+    else:
+        settings = {}
+    return {
+        "free_capital": wallet.get("free_capital")
+        or float(settings.get("free_capital_inr") or 0),
+        "source": wallet.get("source") or settings.get("capital_source") or "unknown",
+        "ts": wallet.get("ts"),
+        "balances": wallet.get("balances") or [],
+        "live_trading": LIVE,
+    }
+
+
 @app.post("/api/kill", dependencies=[Depends(require_token)])
 async def kill():
     if rd:
@@ -149,7 +222,7 @@ async def kill():
 async def refresh_capital():
     if rd:
         await rd.rpush("greeks:commands", "refresh_capital")
-    return {"ok": True}
+    return {"ok": True, "queued": "refresh_capital"}
 
 
 @app.websocket("/ws")
@@ -161,17 +234,28 @@ async def ws(websocket: WebSocket, token: Optional[str] = Query(default=None)):
     pubsub = rd.pubsub() if rd else None
     try:
         if pubsub:
-            await pubsub.subscribe("greeks:dashboard")
+            await pubsub.subscribe("greeks:dashboard", "greeks:log", "greeks:signal")
         while True:
             if pubsub:
                 msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
                 if msg and msg.get("data"):
-                    await websocket.send_text(msg["data"])
+                    channel = msg.get("channel")
+                    raw = msg["data"]
+                    if channel == "greeks:dashboard":
+                        await websocket.send_text(raw if isinstance(raw, str) else json.dumps(raw))
+                    else:
+                        try:
+                            data = json.loads(raw) if isinstance(raw, str) else raw
+                        except Exception:
+                            data = {"line": str(raw)}
+                        await websocket.send_text(
+                            json.dumps({"channel": channel, "data": data})
+                        )
             else:
                 await websocket.receive_text()
     except WebSocketDisconnect:
         pass
     finally:
         if pubsub:
-            await pubsub.unsubscribe("greeks:dashboard")
+            await pubsub.unsubscribe("greeks:dashboard", "greeks:log", "greeks:signal")
             await pubsub.aclose()

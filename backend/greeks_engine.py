@@ -562,6 +562,29 @@ class Store:
         await self.rd.set("greeks:dashboard", json.dumps(snap))
         await self.rd.publish("greeks:dashboard", json.dumps(snap))
 
+    async def push_log(self, line: str):
+        """Append a live log line for the mobile Logs tab."""
+        if not self.rd:
+            return
+        payload = {"ts": time.time(), "line": line}
+        try:
+            await self.rd.lpush("greeks:logs", json.dumps(payload))
+            await self.rd.ltrim("greeks:logs", 0, 199)
+            await self.rd.publish("greeks:log", json.dumps(payload))
+        except Exception:
+            pass
+
+    async def save_wallet_snapshot(self, rows: List[Dict], free: float, source: str):
+        if not self.rd:
+            return
+        payload = {
+            "ts": time.time(),
+            "free_capital": free,
+            "source": source,
+            "balances": rows,
+        }
+        await self.rd.set("greeks:wallet", json.dumps(payload))
+
     async def set_status(self, status: str, detail: str = ""):
         if self.pg:
             await self.pg.execute(
@@ -592,19 +615,34 @@ class Store:
         )
 
     async def save_ai_decision(self, decision: AIDecision):
-        if not self.pg:
-            return
-        await self.pg.execute(
-            """INSERT INTO ai_decisions
-               (model, action, confidence, reasoning, risk_assessment, portfolio_delta)
-               VALUES ($1,$2,$3,$4,$5,$6)""",
-            decision.model_used,
-            decision.action,
-            decision.confidence,
-            decision.reasoning,
-            decision.risk_assessment,
-            0.0,
-        )
+        if self.pg:
+            await self.pg.execute(
+                """INSERT INTO ai_decisions
+                   (model, action, confidence, reasoning, risk_assessment, portfolio_delta)
+                   VALUES ($1,$2,$3,$4,$5,$6)""",
+                decision.model_used,
+                decision.action,
+                decision.confidence,
+                decision.reasoning,
+                decision.risk_assessment,
+                0.0,
+            )
+        if self.rd:
+            payload = {
+                "ts": time.time(),
+                "model": decision.model_used,
+                "action": decision.action,
+                "confidence": decision.confidence,
+                "reasoning": decision.reasoning,
+                "risk_assessment": decision.risk_assessment,
+            }
+            try:
+                await self.rd.set("greeks:ai_last", json.dumps(payload))
+                await self.rd.lpush("greeks:signals", json.dumps(payload))
+                await self.rd.ltrim("greeks:signals", 0, 99)
+                await self.rd.publish("greeks:signal", json.dumps(payload))
+            except Exception:
+                pass
 
     async def pop_command(self) -> Optional[str]:
         if not self.rd:
@@ -624,7 +662,17 @@ class GreeksEngine:
         self._last_fill_ts = 0.0
         self._last_flatten_ts = 0.0
         self._session_pnl = 0.0
+        self._capital_source = "unset"
+        self._last_capital_refresh = 0.0
+        self._ai_last: Optional[Dict] = None
         self._mark_cache: Dict[str, float] = {}
+
+    async def _log(self, line: str):
+        print(line)
+        try:
+            await self.store.push_log(line)
+        except Exception:
+            pass
 
     async def start(self):
         await self.store.connect()
@@ -635,19 +683,20 @@ class GreeksEngine:
         auth = False
         if self.client.api_key:
             auth = await self.client.ping_auth()
-        print("=" * 60)
-        print(" RUBAIH GREEKS — Delta options cycle")
-        print(f" LIVE_TRADING: {'ON' if self._live else 'OFF (dry-run)'}")
-        print(f" Delta auth: {'OK' if auth else 'NO / missing keys'}")
-        print(f" AI: {'ENABLED (OpenRouter→NVIDIA)' if self._ai_enabled else 'DISABLED'}")
-        print(f" Free capital: ₹{self.cycle.free_capital_inr:.0f}")
-        print(
+        await self._log("=" * 60)
+        await self._log(" RUBAIH GREEKS — Delta options cycle")
+        await self._log(f" LIVE_TRADING: {'ON' if self._live else 'OFF (dry-run)'}")
+        await self._log(f" Delta auth: {'OK' if auth else 'NO / missing keys'}")
+        await self._log(f" AI: {'ENABLED (OpenRouter→NVIDIA)' if self._ai_enabled else 'DISABLED'}")
+        await self._log(f" Free capital: {self.cycle.free_capital_inr:.2f} ({self._capital_source})")
+        await self._log(
             f" Exits: TP=+{self.cycle.tp_pct:.0%} SL=-{self.cycle.sl_pct:.0%} "
             f"trail={self.cycle.trail_arm_r}R underlyings={self.cycle.underlyings}"
         )
-        print("=" * 60)
+        await self._log(" AI conf: advisory only; EMERGENCY acts only if conf>0.95")
+        await self._log("=" * 60)
         if self._live and not auth:
-            print("[WARN] LIVE on but Delta auth failed — orders blocked")
+            await self._log("[WARN] LIVE on but Delta auth failed — orders blocked")
         await self.store.set_status("running")
         tasks = [
             self.main_loop(),
@@ -662,22 +711,33 @@ class GreeksEngine:
         # Prefer live wallet INR/USDT convertible; else ledger; else seed
         free = 0.0
         source = "unknown"
+        wallet_rows: List[Dict] = []
         if self.client and self.client._auth_ok:
             try:
                 bals = await self.client.get_balances()
-                for b in bals:
+                wallet_rows = []
+                for b in bals or []:
                     ccy = str(b.get("asset_symbol") or b.get("currency") or "").upper()
                     avail = _f(
                         b.get("available_balance")
                         or b.get("available_balance_for_margin")
                         or b.get("balance")
                     )
+                    total = _f(b.get("balance") or b.get("wallet_balance") or avail)
+                    if ccy:
+                        wallet_rows.append(
+                            {
+                                "asset": ccy,
+                                "available": avail,
+                                "balance": total,
+                            }
+                        )
                     if ccy in ("INR", "USD", "USDT", "USDC") and avail > free:
                         # Treat as INR-budget unit for v1 sizing (approx)
                         free = avail
                         source = f"wallet:{ccy}"
             except Exception as e:
-                print(f"[CAPITAL] wallet error: {e}")
+                await self._log(f"[CAPITAL] wallet error: {e}")
         if free <= 0:
             ledger = await self.store.load_capital()
             free = _f(ledger.get("free_inr"))
@@ -688,7 +748,7 @@ class GreeksEngine:
             free = FREE_SEED / max(self.cycle.usdt_inr, 1.0)
             source = "env_seed_inr_to_quote"
             await self.store.save_capital(free, source)
-            print(
+            await self._log(
                 f"[CAPITAL] seeded ₹{FREE_SEED:.0f} → quote≈{free:.2f} "
                 f"(÷ usdt_inr={self.cycle.usdt_inr:.0f}) day-1 posture"
             )
@@ -696,9 +756,12 @@ class GreeksEngine:
             free = self.cycle.capital_inr
             source = "config"
         self.cycle.set_free_capital(free)
+        self._capital_source = source
+        self._last_capital_refresh = time.time()
         await self.store.save_capital(free, source)
+        await self.store.save_wallet_snapshot(wallet_rows, free, source)
         if force:
-            print(f"[CAPITAL] free=₹{free:.0f} source={source}")
+            await self._log(f"[CAPITAL] free={free:.2f} source={source}")
 
     async def _publish(self):
         t = self.cycle.trade
@@ -710,7 +773,12 @@ class GreeksEngine:
             "live": self._live,
             "free_capital_inr": self.cycle.free_capital_inr,
             "budget_inr": self.cycle.budget(),
+            "capital_source": self._capital_source,
             "session_pnl": self._session_pnl + upnl,
+            "ai_enabled": self._ai_enabled,
+            "ai_last_action": (self._ai_last or {}).get("action"),
+            "ai_confidence": (self._ai_last or {}).get("confidence"),
+            "ai_emergency_conf": 0.95,
             "position": None
             if not t
             else {
@@ -731,7 +799,7 @@ class GreeksEngine:
         await self.store.publish_dashboard(snap)
 
     async def _execute(self, sig: Signal):
-        print(f"[SIGNAL] {sig.reason}")
+        await self._log(f"[SIGNAL] {sig.reason}")
         if sig.action == "BUY" and self.cycle.allow_sell_premium is False:
             pass  # buy path only
         live_ok = self._live and self.client and self.client._auth_ok
@@ -751,12 +819,12 @@ class GreeksEngine:
                         reduce_only=True,
                     )
                 self._last_fill_ts = time.time()
-                print(f"[FILL] LIVE {sig.action} {sig.symbol} size={sig.size}")
+                await self._log(f"[FILL] LIVE {sig.action} {sig.symbol} size={sig.size}")
             except Exception as e:
-                print(f"[ORDER] failed: {e}")
+                await self._log(f"[ORDER] failed: {e}")
                 return
         else:
-            print(f"[DRY] {sig.action} {sig.symbol} size={sig.size} @ {fill_px:.4f}")
+            await self._log(f"[DRY] {sig.action} {sig.symbol} size={sig.size} @ {fill_px:.4f}")
             self._last_fill_ts = time.time()
 
         await self.store.save_trade(sig)
@@ -768,6 +836,7 @@ class GreeksEngine:
             self.cycle.set_free_capital(max(0.0, self.cycle.free_capital_inr - cost - fee))
             await self.store.save_trade_plan(self.cycle.trade_plan_dict())
             await self.store.save_capital(self.cycle.free_capital_inr, "ledger")
+            self._capital_source = "ledger"
         else:
             t = self.cycle.trade
             pnl = 0.0
@@ -785,7 +854,10 @@ class GreeksEngine:
             self._last_flatten_ts = time.time()
             await self.store.save_trade_plan({})
             await self.store.save_capital(self.cycle.free_capital_inr, "ledger")
-            print(f"[FLAT] pnl≈₹{pnl:.0f} free=₹{self.cycle.free_capital_inr:.0f}")
+            self._capital_source = "ledger"
+            await self._log(
+                f"[FLAT] pnl≈{pnl:.2f} free={self.cycle.free_capital_inr:.2f}"
+            )
 
     async def main_loop(self):
         while self._running:
@@ -793,6 +865,8 @@ class GreeksEngine:
                 if not self.client:
                     await asyncio.sleep(2)
                     continue
+                if time.time() - self._last_capital_refresh > 60:
+                    await self._refresh_capital(force=False)
                 tickers = await self.client.get_option_tickers(self.cycle.underlyings)
                 # refresh marks for open trade
                 if self.cycle.trade:
@@ -807,19 +881,19 @@ class GreeksEngine:
                             if exit_sig:
                                 await self._execute(exit_sig)
                     except Exception as e:
-                        print(f"[MARK] {sym}: {e}")
+                        await self._log(f"[MARK] {sym}: {e}")
                 else:
                     entry = self.cycle.pick_entry(tickers or [])
                     if entry:
                         await self._execute(entry)
                     elif int(time.time()) % 60 < 3:
-                        print(
+                        await self._log(
                             f"[SCAN] candidates from {len(tickers or [])} tickers | "
-                            f"free=₹{self.cycle.free_capital_inr:.0f} budget=₹{self.cycle.budget():.0f}"
+                            f"free={self.cycle.free_capital_inr:.2f} budget={self.cycle.budget():.2f}"
                         )
                 await self._publish()
             except Exception as e:
-                print(f"[MAIN] {type(e).__name__}: {e}")
+                await self._log(f"[MAIN] {type(e).__name__}: {e}")
             await asyncio.sleep(3)
 
     async def sync_loop(self):
@@ -848,9 +922,9 @@ class GreeksEngine:
                     mark = self._mark_cache.get(t.symbol, t.entry_premium)
                     cval = float(t.contract_value or 1.0)
                     pnl = (mark - t.entry_premium) * t.size * cval
-                    print(
+                    await self._log(
                         f"[SYNC] Delta flat for {t.symbol} — manual/external close "
-                        f"(pnl≈₹{pnl:.0f})"
+                        f"(pnl≈{pnl:.2f})"
                     )
                     self.cycle.set_free_capital(
                         max(0.0, self.cycle.free_capital_inr + t.premium_budget + pnl)
@@ -862,7 +936,7 @@ class GreeksEngine:
                     await self.store.save_capital(self.cycle.free_capital_inr, "ledger")
                 await asyncio.sleep(5)
             except Exception as e:
-                print(f"[SYNC] {e}")
+                await self._log(f"[SYNC] {e}")
                 await asyncio.sleep(8)
 
     async def command_loop(self):
@@ -874,12 +948,13 @@ class GreeksEngine:
                     continue
                 cmd = cmd.strip().lower()
                 if cmd in ("kill", "flatten", "panic"):
-                    print(f"[CMD] {cmd}")
+                    await self._log(f"[CMD] {cmd}")
                     await self._emergency("operator")
                 elif cmd == "refresh_capital":
                     await self._refresh_capital(force=True)
+                    await self._publish()
             except Exception as e:
-                print(f"[CMD] {e}")
+                await self._log(f"[CMD] {e}")
                 await asyncio.sleep(1)
 
     async def ai_loop(self):
@@ -913,13 +988,25 @@ class GreeksEngine:
                 }
                 decision = await self.ai.analyze(context)
                 if decision:
+                    self._ai_last = {
+                        "action": decision.action,
+                        "confidence": decision.confidence,
+                        "reasoning": decision.reasoning,
+                        "model": decision.model_used,
+                        "risk_assessment": decision.risk_assessment,
+                    }
                     await self.store.save_ai_decision(decision)
+                    await self._log(
+                        f"[AI] {decision.model_used} → {decision.action} "
+                        f"(conf={decision.confidence:.2f}) {decision.reasoning[:120]}"
+                    )
+                    await self._publish()
                     if decision.action == "EMERGENCY" and decision.confidence > 0.95:
-                        print(f"[AI] EMERGENCY: {decision.reasoning}")
+                        await self._log(f"[AI] EMERGENCY: {decision.reasoning}")
                         await self._emergency(f"AI_EMERGENCY: {decision.reasoning}")
                         break
             except Exception as e:
-                print(f"[AI LOOP] {e}")
+                await self._log(f"[AI LOOP] {e}")
             await asyncio.sleep(180)
 
     async def _emergency(self, reason: str = "operator"):
