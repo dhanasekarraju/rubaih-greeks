@@ -1,0 +1,54 @@
+exchange:
+  name: delta
+  # India production API. Global: https://api.delta.exchange
+  base_url: "https://api.india.delta.exchange"
+  taker_fee: 0.0005
+  rest_timeout_sec: 20
+
+trading:
+  mode: options_cycle
+  capital_inr: 1000
+  # Convert INR seed → USDT quote when Delta wallet is USD/USDT
+  usdt_inr: 87
+  margin_use_frac: 0.55
+  margin_use_max_frac: 0.60
+  underlyings:
+    - BTC
+    - ETH
+  # Buy calls/puts only — never sell premium in v1
+  allow_sell_premium: false
+  min_entry_interval_sec: 60
+  strategy:
+    entry_cooldown_sec: 90
+    momentum_lookback: 20
+    entry_move_pct: 0.0015
+    # DTE window — avoid same-day gamma lottery and far-dated dead premium
+    min_dte_days: 1
+    max_dte_days: 7
+    # ATM band as fraction of spot
+    atm_band_pct: 0.02
+    # Reject wide markets
+    max_spread_pct: 0.08
+    min_mark_premium: 0.5
+    # Premium % exits (option price, not underlying)
+    take_profit_premium_pct: 0.25
+    stop_loss_premium_pct: 0.12
+    max_loss_frac: 0.15
+    trail_arm_r: 0.5
+    trail_giveback_r: 0.4
+    trail_giveback_of_peak: 0.25
+    max_hold_sec: 0
+
+risk:
+  kill_switch_on_drawdown: true
+  max_drawdown_pct: 0.20
+  emergency_flatten: true
+  rate_limit_orders_per_sec: 3
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+
+logging:
+  level: "INFO"
+  file: "logs/rubaih_greeks.log"

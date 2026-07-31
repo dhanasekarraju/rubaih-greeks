@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+logs/*.log
+.idea/
+.DS_Store
+mobile/node_modules/
+*.apk
