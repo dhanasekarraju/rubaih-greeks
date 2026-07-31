@@ -210,7 +210,7 @@ export default function App() {
       Alert.alert(
         'Refresh failed',
         msg.includes('502')
-          ? 'Nginx 502 — API down. On VPS run:\ndocker compose up -d --force-recreate greeks_api greeks_nginx'
+          ? 'Nginx 502 — API down. On VPS run:\ndocker compose up -d --force-recreate greeks_api nginx'
           : msg,
       );
     }
@@ -293,7 +293,7 @@ export default function App() {
               <View style={[styles.card, { borderColor: C.bad }]}>
                 <Text style={styles.cardTitle}>API offline (502?)</Text>
                 <Text style={styles.help}>
-                  Host must be :8088. On VPS: docker compose ps && docker compose up -d --force-recreate greeks_api greeks_nginx
+                  Host must be :8088. On VPS: docker compose ps && docker compose up -d --force-recreate greeks_api nginx
                 </Text>
               </View>
             )}

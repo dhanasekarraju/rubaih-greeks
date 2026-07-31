@@ -26,4 +26,5 @@ echo
 echo "Health:  curl -s http://127.0.0.1:8018/api/health"
 echo "Public:  curl -s http://103.194.228.130:8088/api/health"
 echo "Logs:    docker compose logs -f greeks_engine"
+echo "Recreate: docker compose up -d --force-recreate greeks_api nginx greeks_engine"
 echo "Keep LIVE_TRADING=false until dry-run looks clean."
