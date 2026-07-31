@@ -85,12 +85,19 @@ export default function App() {
 
   const apiFetch = useCallback(async (path, opts = {}) => {
     const c = connRef.current;
-    const res = await fetch(`${c.apiUrl}${path}`, {
-      ...opts,
-      headers: { ...c.authHeaders, ...(opts.headers || {}) },
-    });
-    if (!res.ok) throw new Error(`${path} → ${res.status}`);
-    return res.json();
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 12000);
+    try {
+      const res = await fetch(`${c.apiUrl}${path}`, {
+        ...opts,
+        signal: ctrl.signal,
+        headers: { ...c.authHeaders, ...(opts.headers || {}) },
+      });
+      if (!res.ok) throw new Error(`${path} → ${res.status}`);
+      return res.json();
+    } finally {
+      clearTimeout(timer);
+    }
   }, []);
 
   const refresh = useCallback(async () => {
@@ -98,7 +105,8 @@ export default function App() {
     if (!c.configured) return;
     setRefreshing(true);
     try {
-      const [dash, set, tr, bal, lg, sig] = await Promise.all([
+      // Independent fetches — one 502/404 must not blank the whole Home screen
+      const results = await Promise.allSettled([
         apiFetch('/dashboard'),
         apiFetch('/settings'),
         apiFetch('/trades?limit=30'),
@@ -107,13 +115,19 @@ export default function App() {
         apiFetch('/signals?limit=40'),
       ]);
       if (!aliveRef.current) return;
-      setDashboard(dash);
-      setSettings(set);
-      setTrades(Array.isArray(tr) ? tr : []);
-      setBalance(bal);
-      setLogs(Array.isArray(lg) ? lg : []);
-      setSignals(Array.isArray(sig) ? sig : []);
-      setConnected(true);
+      const [dash, set, tr, bal, lg, sig] = results;
+      let ok = 0;
+      if (dash.status === 'fulfilled') { setDashboard(dash.value); ok += 1; }
+      if (set.status === 'fulfilled') { setSettings(set.value); ok += 1; }
+      if (tr.status === 'fulfilled') setTrades(Array.isArray(tr.value) ? tr.value : []);
+      if (bal.status === 'fulfilled') setBalance(bal.value);
+      if (lg.status === 'fulfilled') setLogs(Array.isArray(lg.value) ? lg.value : []);
+      if (sig.status === 'fulfilled') setSignals(Array.isArray(sig.value) ? sig.value : []);
+      setConnected(ok > 0);
+      if (ok === 0) {
+        const first = results.find((r) => r.status === 'rejected');
+        console.warn(first?.reason || 'all endpoints failed');
+      }
     } catch (e) {
       setConnected(false);
       console.warn(e);
@@ -192,7 +206,13 @@ export default function App() {
       Alert.alert('Queued', 'Fetching live Delta wallet…');
       setTimeout(refresh, 2500);
     } catch (e) {
-      Alert.alert('Failed', String(e.message || e));
+      const msg = String(e.message || e);
+      Alert.alert(
+        'Refresh failed',
+        msg.includes('502')
+          ? 'Nginx 502 — API down. On VPS run:\ndocker compose up -d --force-recreate greeks_api greeks_nginx'
+          : msg,
+      );
     }
   };
 
@@ -269,6 +289,14 @@ export default function App() {
       >
         {activeTab === 'dashboard' && (
           <>
+            {!connected && (
+              <View style={[styles.card, { borderColor: C.bad }]}>
+                <Text style={styles.cardTitle}>API offline (502?)</Text>
+                <Text style={styles.help}>
+                  Host must be :8088. On VPS: docker compose ps && docker compose up -d --force-recreate greeks_api greeks_nginx
+                </Text>
+              </View>
+            )}
             <View style={styles.card}>
               <Text style={styles.cardTitle}>Live account balance</Text>
               <Row label="Free (cycle)" value={fmt(free)} />
@@ -288,8 +316,8 @@ export default function App() {
                   ))}
                 </View>
               )}
-              <TouchableOpacity style={styles.secondaryBtn} onPress={refreshWallet}>
-                <Text style={styles.secondaryText}>Refresh from Delta</Text>
+              <TouchableOpacity style={styles.secondaryBtn} onPress={refreshWallet} activeOpacity={0.8}>
+                <Text style={styles.secondaryText} numberOfLines={1}>Refresh from Delta</Text>
               </TouchableOpacity>
             </View>
 
@@ -327,8 +355,8 @@ export default function App() {
               <Row label="Underlyings" value={settings?.underlyings || 'BTC,ETH'} />
             </View>
 
-            <TouchableOpacity style={styles.dangerBtn} onPress={kill}>
-              <Text style={styles.dangerText}>Kill switch</Text>
+            <TouchableOpacity style={styles.dangerBtn} onPress={kill} activeOpacity={0.8}>
+              <Text style={styles.dangerText} numberOfLines={1}>Kill switch</Text>
             </TouchableOpacity>
           </>
         )}
@@ -414,8 +442,8 @@ export default function App() {
               secureTextEntry
               placeholderTextColor={C.muted}
             />
-            <TouchableOpacity style={styles.primaryBtn} onPress={saveConnection} disabled={saving}>
-              <Text style={styles.primaryText}>{saving ? 'Saving…' : 'Save & connect'}</Text>
+            <TouchableOpacity style={styles.primaryBtn} onPress={saveConnection} disabled={saving} activeOpacity={0.8}>
+              <Text style={styles.primaryText} numberOfLines={1}>{saving ? 'Saving…' : 'Save & connect'}</Text>
             </TouchableOpacity>
             <Text style={styles.help}>
               Same VPS as futures Rubaih. Greeks uses port 8088; futures uses 8080. Teal icon = Greeks.
@@ -446,14 +474,15 @@ const styles = StyleSheet.create({
   brand: { color: C.text, fontSize: 22, fontWeight: '800', letterSpacing: 0.3 },
   sub: { color: C.muted, marginTop: 2, fontSize: 12 },
   pill: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999 },
-  tabScroll: { maxHeight: 48, borderBottomWidth: 1, borderBottomColor: C.border },
-  tabRow: { paddingHorizontal: 12, paddingVertical: 8, gap: 8 },
+  tabScroll: { flexGrow: 0, borderBottomWidth: 1, borderBottomColor: C.border },
+  tabRow: { paddingHorizontal: 12, paddingVertical: 10, alignItems: 'center' },
   tabChip: {
-    paddingHorizontal: 14, paddingVertical: 8, borderRadius: 10,
+    paddingHorizontal: 14, paddingVertical: 10, borderRadius: 10, minHeight: 40,
+    justifyContent: 'center',
     backgroundColor: C.card, borderWidth: 1, borderColor: C.border, marginRight: 8,
   },
   tabChipOn: { backgroundColor: C.accentDim, borderColor: C.accent },
-  tabChipText: { color: C.muted, fontWeight: '600', fontSize: 13 },
+  tabChipText: { color: C.muted, fontWeight: '600', fontSize: 13, includeFontPadding: false },
   tabChipTextOn: { color: C.accent },
   card: {
     backgroundColor: C.card, borderColor: C.border, borderWidth: 1,
@@ -461,28 +490,32 @@ const styles = StyleSheet.create({
   },
   cardTitle: { color: C.text, fontSize: 15, fontWeight: '700', marginBottom: 10 },
   help: { color: C.muted, fontSize: 12, lineHeight: 18, marginTop: 8 },
-  row: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 8 },
-  rowLabel: { color: C.muted, fontSize: 13 },
-  rowValue: { color: C.text, fontSize: 13, fontWeight: '600', maxWidth: '62%', textAlign: 'right' },
+  row: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 8, alignItems: 'flex-start' },
+  rowLabel: { color: C.muted, fontSize: 13, flexShrink: 0, paddingRight: 8 },
+  rowValue: { color: C.text, fontSize: 13, fontWeight: '600', flex: 1, textAlign: 'right', flexWrap: 'wrap' },
   label: { color: C.muted, fontSize: 12, marginBottom: 6, marginTop: 8 },
   input: {
     backgroundColor: C.inputBg, borderColor: C.border, borderWidth: 1, borderRadius: 10,
-    color: C.text, paddingHorizontal: 12, paddingVertical: 10, marginBottom: 4,
+    color: C.text, paddingHorizontal: 12, paddingVertical: 12, marginBottom: 4, minHeight: 46,
   },
   primaryBtn: {
-    marginTop: 14, backgroundColor: C.accent, borderRadius: 12, paddingVertical: 12, alignItems: 'center',
+    marginTop: 14, backgroundColor: C.accent, borderRadius: 12,
+    paddingVertical: 14, paddingHorizontal: 16, minHeight: 48,
+    alignItems: 'center', justifyContent: 'center',
   },
-  primaryText: { color: '#04221f', fontWeight: '800' },
+  primaryText: { color: '#04221f', fontWeight: '800', fontSize: 15, includeFontPadding: false },
   secondaryBtn: {
     marginTop: 12, borderColor: C.accent, borderWidth: 1, borderRadius: 12,
-    paddingVertical: 11, alignItems: 'center',
+    paddingVertical: 14, paddingHorizontal: 16, minHeight: 48,
+    alignItems: 'center', justifyContent: 'center',
   },
-  secondaryText: { color: C.accent, fontWeight: '700' },
+  secondaryText: { color: C.accent, fontWeight: '700', fontSize: 14, includeFontPadding: false },
   dangerBtn: {
     backgroundColor: 'rgba(231,76,60,0.15)', borderColor: C.bad, borderWidth: 1,
-    borderRadius: 12, paddingVertical: 14, alignItems: 'center', marginTop: 4,
+    borderRadius: 12, paddingVertical: 14, paddingHorizontal: 16, minHeight: 48,
+    alignItems: 'center', justifyContent: 'center', marginTop: 4,
   },
-  dangerText: { color: C.bad, fontWeight: '800' },
+  dangerText: { color: C.bad, fontWeight: '800', fontSize: 15, includeFontPadding: false },
   tradeRow: { paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: C.border },
   tradeMain: { color: C.text, fontWeight: '700', marginBottom: 2 },
   logLine: {

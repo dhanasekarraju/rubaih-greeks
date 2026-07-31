@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Any, Dict, Optional
 
 import asyncpg
@@ -15,6 +17,7 @@ import yaml
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pathlib import Path
 
 load_dotenv()
@@ -29,6 +32,19 @@ try:
 except Exception:  # pragma: no cover
     def ai_configured() -> bool:  # type: ignore
         return False
+
+
+def _jsonable(v: Any) -> Any:
+    if isinstance(v, Decimal):
+        return float(v)
+    if isinstance(v, (datetime, date)):
+        return v.isoformat()
+    if isinstance(v, dict):
+        return {k: _jsonable(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_jsonable(x) for x in v]
+    return v
+
 
 app = FastAPI(title="Rubaih Greeks", version="0.1.0")
 app.add_middleware(
@@ -98,7 +114,25 @@ async def dashboard():
     data = json.loads(raw) if raw else {}
     data["engine_status"] = status or "unknown"
     data["live_trading"] = LIVE
-    return data
+    # Fill gaps from redis so mobile Home works even if wallet key is empty
+    if rd:
+        settings = await rd.hgetall("greeks:settings") or {}
+        if data.get("free_capital_inr") is None and settings.get("free_capital_inr"):
+            try:
+                data["free_capital_inr"] = float(settings["free_capital_inr"])
+            except (TypeError, ValueError):
+                data["free_capital_inr"] = settings["free_capital_inr"]
+        if not data.get("capital_source") and settings.get("capital_source"):
+            data["capital_source"] = settings["capital_source"]
+        ai_raw = await rd.get("greeks:ai_last")
+        if ai_raw and not data.get("ai_last_action"):
+            try:
+                ai = json.loads(ai_raw)
+                data["ai_last_action"] = ai.get("action")
+                data["ai_confidence"] = ai.get("confidence")
+            except Exception:
+                pass
+    return _jsonable(data)
 
 
 @app.get("/api/settings", dependencies=[Depends(require_token)])
@@ -138,7 +172,7 @@ async def trades(limit: int = Query(default=30, ge=1, le=200)):
     rows = await pg_pool.fetch(
         "SELECT * FROM option_trades ORDER BY timestamp DESC LIMIT $1", limit
     )
-    return [dict(r) for r in rows]
+    return JSONResponse(content=_jsonable([dict(r) for r in rows]))
 
 
 @app.get("/api/logs", dependencies=[Depends(require_token)])
@@ -163,7 +197,7 @@ async def get_signals(limit: int = Query(default=40, ge=1, le=100)):
             "SELECT * FROM ai_decisions ORDER BY timestamp DESC LIMIT $1", limit
         )
         if rows:
-            return [
+            return _jsonable([
                 {
                     "id": r["id"],
                     "ts": r["timestamp"].isoformat() if r["timestamp"] else None,
@@ -174,7 +208,7 @@ async def get_signals(limit: int = Query(default=40, ge=1, le=100)):
                     "risk_assessment": r["risk_assessment"],
                 }
                 for r in rows
-            ]
+            ])
     if not rd:
         return []
     rows = await rd.lrange("greeks:signals", 0, limit - 1)
