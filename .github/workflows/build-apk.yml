@@ -1,0 +1,118 @@
+name: Build Rubaih Greeks APK (No Expo EAS)
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      api_host:
+        description: "API host URL e.g. http://103.194.228.130:8088 (no trailing slash)"
+        required: false
+        default: ""
+      api_token:
+        description: "RUBAIH_GREEKS_API_TOKEN (leave empty to use secrets.RUBAIH_GREEKS_API_TOKEN)"
+        required: false
+        default: ""
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Generate mobile/config.js from example + secrets
+        env:
+          API_HOST: ${{ github.event.inputs.api_host }}
+          API_TOKEN: ${{ github.event.inputs.api_token || secrets.RUBAIH_GREEKS_API_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          example = Path("mobile/config.example.js")
+          if not example.exists():
+              raise SystemExit("missing mobile/config.example.js")
+
+          text = example.read_text()
+          host = (os.environ.get("API_HOST") or "").strip().rstrip("/")
+          token = (os.environ.get("API_TOKEN") or "").strip()
+
+          if host:
+              if not host.startswith("http"):
+                  host = "http://" + host
+              # Replace default host in the example file
+              text = text.replace("http://103.194.228.130:8088", host)
+              print(f"Injected API_HOST={host}")
+          else:
+              print("Using default host from config.example.js (public :8088)")
+
+          if token:
+              text = text.replace("REPLACE_WITH_RUBAIH_GREEKS_API_TOKEN", token)
+              print("Injected RUBAIH_GREEKS_API_TOKEN")
+          else:
+              print("WARNING: RUBAIH_GREEKS_API_TOKEN not set — APK will use placeholder token (set in app Settings)")
+
+          Path("mobile/config.js").write_text(text)
+          print("Wrote mobile/config.js")
+          PY
+
+      - name: Install dependencies
+        run: |
+          cd mobile
+          npm install
+
+      - name: Prebuild Android project
+        run: |
+          cd mobile
+          npx expo prebuild --platform android --non-interactive
+
+      - name: Use debug keystore for CI release APK
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          p = Path("mobile/android/app/build.gradle")
+          if not p.exists():
+              raise SystemExit(f"missing {p}")
+          text = p.read_text()
+          if "signingConfig signingConfigs.debug" in text:
+              print("Signing already configured")
+          else:
+              text2, n = re.subn(
+                  r"(release\s*\{)",
+                  r"\1\n            signingConfig signingConfigs.debug",
+                  text,
+                  count=1,
+              )
+              if not n:
+                  raise SystemExit("Could not patch release signingConfig")
+              p.write_text(text2)
+              print("Patched release signingConfig → debug")
+          PY
+
+      - name: Build Release APK
+        run: |
+          cd mobile/android
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: rubaih-greeks-apk
+          path: mobile/android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
