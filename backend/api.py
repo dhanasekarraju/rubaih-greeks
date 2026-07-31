@@ -24,6 +24,12 @@ CFG = yaml.safe_load((ROOT / "config.yaml").read_text())
 TOKEN = os.getenv("RUBAIH_GREEKS_API_TOKEN", "").strip()
 LIVE = os.getenv("LIVE_TRADING", "false").strip().lower() in ("1", "true", "yes")
 
+try:
+    from ai_advisor import ai_configured
+except Exception:  # pragma: no cover
+    def ai_configured() -> bool:  # type: ignore
+        return False
+
 app = FastAPI(title="Rubaih Greeks", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
@@ -76,7 +82,13 @@ async def shutdown():
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "service": "rubaih-greeks", "live": LIVE}
+    return {
+        "ok": True,
+        "service": "rubaih-greeks",
+        "live": LIVE,
+        "ai_enabled": ai_configured(),
+        "ai_order": "openrouter→nvidia",
+    }
 
 
 @app.get("/api/dashboard", dependencies=[Depends(require_token)])

@@ -26,6 +26,7 @@ import redis.asyncio as aioredis
 import yaml
 from dotenv import load_dotenv
 
+from ai_advisor import GreeksAI, AIDecision, ai_configured
 from delta_client import DeltaClient, env_delta_client
 
 load_dotenv()
@@ -588,6 +589,21 @@ class Store:
             ai,
         )
 
+    async def save_ai_decision(self, decision: AIDecision):
+        if not self.pg:
+            return
+        await self.pg.execute(
+            """INSERT INTO ai_decisions
+               (model, action, confidence, reasoning, risk_assessment, portfolio_delta)
+               VALUES ($1,$2,$3,$4,$5,$6)""",
+            decision.model_used,
+            decision.action,
+            decision.confidence,
+            decision.reasoning,
+            decision.risk_assessment,
+            0.0,
+        )
+
     async def pop_command(self) -> Optional[str]:
         if not self.rd:
             return None
@@ -599,6 +615,8 @@ class GreeksEngine:
         self.store = Store()
         self.cycle = OptionsCycle(CFG)
         self.client: Optional[DeltaClient] = None
+        self.ai = GreeksAI()
+        self._ai_enabled = ai_configured()
         self._live = LIVE_TRADING
         self._running = True
         self._last_fill_ts = 0.0
@@ -619,6 +637,7 @@ class GreeksEngine:
         print(" RUBAIH GREEKS — Delta options cycle")
         print(f" LIVE_TRADING: {'ON' if self._live else 'OFF (dry-run)'}")
         print(f" Delta auth: {'OK' if auth else 'NO / missing keys'}")
+        print(f" AI: {'ENABLED (OpenRouter→NVIDIA)' if self._ai_enabled else 'DISABLED'}")
         print(f" Free capital: ₹{self.cycle.free_capital_inr:.0f}")
         print(
             f" Exits: TP=+{self.cycle.tp_pct:.0%} SL=-{self.cycle.sl_pct:.0%} "
@@ -628,11 +647,14 @@ class GreeksEngine:
         if self._live and not auth:
             print("[WARN] LIVE on but Delta auth failed — orders blocked")
         await self.store.set_status("running")
-        await asyncio.gather(
+        tasks = [
             self.main_loop(),
             self.sync_loop(),
             self.command_loop(),
-        )
+        ]
+        if self._ai_enabled:
+            tasks.append(self.ai_loop())
+        await asyncio.gather(*tasks)
 
     async def _refresh_capital(self, force: bool = False):
         # Prefer live wallet INR/USDT convertible; else ledger; else seed
@@ -851,15 +873,55 @@ class GreeksEngine:
                 cmd = cmd.strip().lower()
                 if cmd in ("kill", "flatten", "panic"):
                     print(f"[CMD] {cmd}")
-                    await self._emergency()
+                    await self._emergency("operator")
                 elif cmd == "refresh_capital":
                     await self._refresh_capital(force=True)
             except Exception as e:
                 print(f"[CMD] {e}")
                 await asyncio.sleep(1)
 
-    async def _emergency(self):
-        await self.store.set_status("kill_switch", "operator")
+    async def ai_loop(self):
+        """Advisory overlay every ~3 minutes. Quant remains authority."""
+        while self._running:
+            try:
+                t = self.cycle.trade
+                mark = self._mark_cache.get(t.symbol, 0.0) if t else 0.0
+                upnl = 0.0
+                pos = None
+                if t and mark > 0:
+                    upnl = (mark - t.entry_premium) * t.size * float(t.contract_value or 1.0)
+                    pos = {
+                        "symbol": t.symbol,
+                        "side": "long",
+                        "option_type": t.option_type,
+                        "strike": t.strike,
+                        "size": t.size,
+                        "entry": t.entry_premium,
+                        "mark": mark,
+                        "tp": t.tp,
+                        "sl": t.sl,
+                    }
+                context = {
+                    "free_capital": self.cycle.free_capital_inr,
+                    "quant_signal": "HOLD" if t else "SCAN",
+                    "position": pos,
+                    "upnl": upnl,
+                    "underlyings": self.cycle.underlyings,
+                    "notes": "buy-side options cycle; no premium selling",
+                }
+                decision = await self.ai.analyze(context)
+                if decision:
+                    await self.store.save_ai_decision(decision)
+                    if decision.action == "EMERGENCY" and decision.confidence > 0.95:
+                        print(f"[AI] EMERGENCY: {decision.reasoning}")
+                        await self._emergency(f"AI_EMERGENCY: {decision.reasoning}")
+                        break
+            except Exception as e:
+                print(f"[AI LOOP] {e}")
+            await asyncio.sleep(180)
+
+    async def _emergency(self, reason: str = "operator"):
+        await self.store.set_status("kill_switch", reason)
         t = self.cycle.trade
         if t:
             sig = Signal(
@@ -871,7 +933,8 @@ class GreeksEngine:
                 underlying=t.underlying,
                 option_type=t.option_type,
                 strike=t.strike,
-                reason="EXIT_EMERGENCY",
+                contract_value=t.contract_value,
+                reason=f"EXIT_EMERGENCY: {reason}",
             )
             await self._execute(sig)
         self._running = False
@@ -879,6 +942,7 @@ class GreeksEngine:
     async def shutdown(self):
         self._running = False
         await self.store.set_status("stopped")
+        await self.ai.close()
         if self.client:
             await self.client.close()
         await self.store.close()
