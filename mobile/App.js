@@ -246,9 +246,18 @@ export default function App() {
   const pos = dashboard?.position;
   const live = String(dashboard?.live_trading ?? settings?.live_trading ?? 'false') === 'true'
     || dashboard?.live === true;
-  const free = balance?.free_capital ?? dashboard?.free_capital_inr ?? settings?.free_capital_inr;
+  const free = balance?.free_quote ?? balance?.free_capital ?? dashboard?.free_quote
+    ?? dashboard?.free_capital_inr ?? settings?.free_capital_inr;
+  const quoteCcy = balance?.quote_ccy || dashboard?.quote_ccy || settings?.quote_ccy || 'USDT';
+  const freeInr = balance?.free_inr_approx ?? dashboard?.free_inr_approx
+    ?? settings?.free_inr_approx;
   const source = balance?.source || dashboard?.capital_source || settings?.capital_source || '—';
   const walletRows = Array.isArray(balance?.balances) ? balance.balances : [];
+  const freeLabel = free == null
+    ? '—'
+    : `${fmt(free, 4)} ${quoteCcy}${freeInr != null && Number(freeInr) > 0 ? `  (≈ ₹${fmt(freeInr, 0)})` : ''}`;
+  const budgetRaw = dashboard?.budget_quote ?? dashboard?.budget_inr;
+  const budgetLabel = budgetRaw == null ? '—' : `${fmt(budgetRaw, 4)} ${quoteCcy}`;
 
   return (
     <SafeAreaView style={styles.root}>
@@ -299,11 +308,14 @@ export default function App() {
             )}
             <View style={styles.card}>
               <Text style={styles.cardTitle}>Live account balance</Text>
-              <Row label="Free (cycle)" value={fmt(free)} />
-              <Row label="Budget" value={fmt(dashboard?.budget_inr)} />
+              <Row label="Free (Delta)" value={freeLabel} />
+              <Row label="Budget / trade" value={budgetLabel} />
               <Row label="Source" value={String(source)} />
-              <Row label="Session PnL" value={fmt(dashboard?.session_pnl)} />
+              <Row label="Session PnL" value={`${fmt(dashboard?.session_pnl)} ${quoteCcy}`} />
               <Row label="Engine" value={String(dashboard?.engine_status || '—')} />
+              <Text style={[styles.help, { marginTop: 6 }]}>
+                Delta options are USDT-quoted. ₹ is approximate (× usdt_inr) — same money as USDT, not a second balance.
+              </Text>
               {walletRows.length > 0 && (
                 <View style={{ marginTop: 8 }}>
                   <Text style={styles.help}>Delta wallet</Text>

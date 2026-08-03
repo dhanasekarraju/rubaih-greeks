@@ -238,6 +238,11 @@ async def get_balance():
     return {
         "free_capital": wallet.get("free_capital")
         or float(settings.get("free_capital_inr") or 0),
+        "free_quote": wallet.get("free_quote")
+        or float(settings.get("free_quote") or settings.get("free_capital_inr") or 0),
+        "quote_ccy": wallet.get("quote_ccy") or settings.get("quote_ccy") or "USDT",
+        "free_inr_approx": wallet.get("free_inr_approx")
+        or float(settings.get("free_inr_approx") or 0),
         "source": wallet.get("source") or settings.get("capital_source") or "unknown",
         "ts": wallet.get("ts"),
         "balances": wallet.get("balances") or [],

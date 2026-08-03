@@ -540,14 +540,29 @@ class Store:
         raw = await self.rd.get("greeks:trade_plan")
         return json.loads(raw) if raw else {}
 
-    async def save_capital(self, free: float, source: str):
+    async def save_capital(self, free: float, source: str, quote_ccy: str = "USDT", usdt_inr: float = 87.0):
         if not self.rd:
             return
-        payload = {"free_inr": free, "source": source, "ts": time.time()}
+        ccy = (quote_ccy or "USDT").upper()
+        inr_approx = free * usdt_inr if ccy in ("USDT", "USD", "USDC") else free
+        payload = {
+            "free_inr": free,  # legacy: cycle free in quote units
+            "free_quote": free,
+            "quote_ccy": ccy,
+            "free_inr_approx": inr_approx,
+            "source": source,
+            "ts": time.time(),
+        }
         await self.rd.set("greeks:capital_ledger", json.dumps(payload))
         await self.rd.hset(
             "greeks:settings",
-            mapping={"free_capital_inr": f"{free:.2f}", "capital_source": source},
+            mapping={
+                "free_capital_inr": f"{free:.2f}",
+                "free_quote": f"{free:.4f}",
+                "quote_ccy": ccy,
+                "free_inr_approx": f"{inr_approx:.2f}",
+                "capital_source": source,
+            },
         )
 
     async def load_capital(self) -> Dict:
@@ -574,12 +589,24 @@ class Store:
         except Exception:
             pass
 
-    async def save_wallet_snapshot(self, rows: List[Dict], free: float, source: str):
+    async def save_wallet_snapshot(
+        self,
+        rows: List[Dict],
+        free: float,
+        source: str,
+        quote_ccy: str = "USDT",
+        usdt_inr: float = 87.0,
+    ):
         if not self.rd:
             return
+        ccy = (quote_ccy or "USDT").upper()
+        inr_approx = free * usdt_inr if ccy in ("USDT", "USD", "USDC") else free
         payload = {
             "ts": time.time(),
             "free_capital": free,
+            "free_quote": free,
+            "quote_ccy": ccy,
+            "free_inr_approx": inr_approx,
             "source": source,
             "balances": rows,
         }
@@ -663,6 +690,7 @@ class GreeksEngine:
         self._last_flatten_ts = 0.0
         self._session_pnl = 0.0
         self._capital_source = "unset"
+        self._quote_ccy = "USDT"
         self._last_capital_refresh = 0.0
         self._ai_last: Optional[Dict] = None
         self._mark_cache: Dict[str, float] = {}
@@ -708,14 +736,17 @@ class GreeksEngine:
         await asyncio.gather(*tasks)
 
     async def _refresh_capital(self, force: bool = False):
-        # Prefer live wallet INR/USDT convertible; else ledger; else seed
+        # Prefer live wallet quote (USDT on Delta India options); else ledger; else seed
         free = 0.0
         source = "unknown"
+        quote_ccy = "USDT"
         wallet_rows: List[Dict] = []
         if self.client and self.client._auth_ok:
             try:
                 bals = await self.client.get_balances()
                 wallet_rows = []
+                best_usdt = 0.0
+                best_inr = 0.0
                 for b in bals or []:
                     ccy = str(b.get("asset_symbol") or b.get("currency") or "").upper()
                     avail = _f(
@@ -732,47 +763,73 @@ class GreeksEngine:
                                 "balance": total,
                             }
                         )
-                    if ccy in ("INR", "USD", "USDT", "USDC") and avail > free:
-                        # Treat as INR-budget unit for v1 sizing (approx)
-                        free = avail
-                        source = f"wallet:{ccy}"
+                    if ccy in ("USDT", "USD", "USDC") and avail > best_usdt:
+                        best_usdt = avail
+                    if ccy == "INR" and avail > best_inr:
+                        best_inr = avail
+                # Delta India options are USDT-quoted — prefer USDT wallet for sizing
+                if best_usdt > 0:
+                    free = best_usdt
+                    quote_ccy = "USDT"
+                    source = "wallet:USDT"
+                elif best_inr > 0:
+                    free = best_inr
+                    quote_ccy = "INR"
+                    source = "wallet:INR"
             except Exception as e:
                 await self._log(f"[CAPITAL] wallet error: {e}")
         if free <= 0:
             ledger = await self.store.load_capital()
-            free = _f(ledger.get("free_inr"))
+            free = _f(ledger.get("free_quote") or ledger.get("free_inr"))
             if free > 0:
+                quote_ccy = str(ledger.get("quote_ccy") or "USDT").upper()
                 source = "ledger"
         if free <= 0 and FREE_SEED > 0:
-            # Env seed is INR intent; Delta India options are typically USDT-quoted.
+            # Env seed is INR intent; convert once to USDT quote for sizing
             free = FREE_SEED / max(self.cycle.usdt_inr, 1.0)
-            source = "env_seed_inr_to_quote"
-            await self.store.save_capital(free, source)
+            quote_ccy = "USDT"
+            source = "env_seed_inr_to_usdt"
+            await self.store.save_capital(free, source, quote_ccy, self.cycle.usdt_inr)
             await self._log(
-                f"[CAPITAL] seeded ₹{FREE_SEED:.0f} → quote≈{free:.2f} "
+                f"[CAPITAL] seeded ₹{FREE_SEED:.0f} → {free:.4f} USDT "
                 f"(÷ usdt_inr={self.cycle.usdt_inr:.0f}) day-1 posture"
             )
         if free <= 0:
-            free = self.cycle.capital_inr
+            free = self.cycle.capital_inr / max(self.cycle.usdt_inr, 1.0)
+            quote_ccy = "USDT"
             source = "config"
         self.cycle.set_free_capital(free)
         self._capital_source = source
+        self._quote_ccy = quote_ccy
         self._last_capital_refresh = time.time()
-        await self.store.save_capital(free, source)
-        await self.store.save_wallet_snapshot(wallet_rows, free, source)
+        await self.store.save_capital(free, source, quote_ccy, self.cycle.usdt_inr)
+        await self.store.save_wallet_snapshot(
+            wallet_rows, free, source, quote_ccy, self.cycle.usdt_inr
+        )
         if force:
-            await self._log(f"[CAPITAL] free={free:.2f} source={source}")
+            inr = free * self.cycle.usdt_inr if quote_ccy in ("USDT", "USD", "USDC") else free
+            await self._log(
+                f"[CAPITAL] free={free:.4f} {quote_ccy} (≈₹{inr:.0f}) source={source}"
+            )
 
     async def _publish(self):
         t = self.cycle.trade
         mark = self._mark_cache.get(t.symbol, 0.0) if t else 0.0
         upnl = ((mark - t.entry_premium) * t.size * float(t.contract_value or 1.0)) if t and mark > 0 else 0.0
+        free = float(self.cycle.free_capital_inr or 0)
+        ccy = getattr(self, "_quote_ccy", "USDT") or "USDT"
+        inr_approx = free * float(self.cycle.usdt_inr) if ccy in ("USDT", "USD", "USDC") else free
         snap = {
             "ts": time.time(),
             "mode": "options_cycle",
             "live": self._live,
-            "free_capital_inr": self.cycle.free_capital_inr,
+            "free_capital_inr": free,  # legacy: quote units used for sizing
+            "free_quote": free,
+            "quote_ccy": ccy,
+            "free_inr_approx": inr_approx,
+            "usdt_inr": self.cycle.usdt_inr,
             "budget_inr": self.cycle.budget(),
+            "budget_quote": self.cycle.budget(),
             "capital_source": self._capital_source,
             "session_pnl": self._session_pnl + upnl,
             "ai_enabled": self._ai_enabled,
@@ -835,7 +892,12 @@ class GreeksEngine:
             self.cycle.arm(sig, fill_px)
             self.cycle.set_free_capital(max(0.0, self.cycle.free_capital_inr - cost - fee))
             await self.store.save_trade_plan(self.cycle.trade_plan_dict())
-            await self.store.save_capital(self.cycle.free_capital_inr, "ledger")
+            await self.store.save_capital(
+                self.cycle.free_capital_inr,
+                "ledger",
+                getattr(self, "_quote_ccy", "USDT"),
+                self.cycle.usdt_inr,
+            )
             self._capital_source = "ledger"
         else:
             t = self.cycle.trade
@@ -853,7 +915,12 @@ class GreeksEngine:
             self.cycle.clear()
             self._last_flatten_ts = time.time()
             await self.store.save_trade_plan({})
-            await self.store.save_capital(self.cycle.free_capital_inr, "ledger")
+            await self.store.save_capital(
+                self.cycle.free_capital_inr,
+                "ledger",
+                getattr(self, "_quote_ccy", "USDT"),
+                self.cycle.usdt_inr,
+            )
             self._capital_source = "ledger"
             await self._log(
                 f"[FLAT] pnl≈{pnl:.2f} free={self.cycle.free_capital_inr:.2f}"
@@ -933,7 +1000,12 @@ class GreeksEngine:
                     self.cycle.clear()
                     self._last_flatten_ts = time.time()
                     await self.store.save_trade_plan({})
-                    await self.store.save_capital(self.cycle.free_capital_inr, "ledger")
+                    await self.store.save_capital(
+                        self.cycle.free_capital_inr,
+                        "ledger",
+                        getattr(self, "_quote_ccy", "USDT"),
+                        self.cycle.usdt_inr,
+                    )
                 await asyncio.sleep(5)
             except Exception as e:
                 await self._log(f"[SYNC] {e}")
