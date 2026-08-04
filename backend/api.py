@@ -299,8 +299,8 @@ async def sync_positions():
 
 @app.post("/api/clear-history", dependencies=[Depends(require_token)])
 async def clear_history():
-    """Wipe trade + AI signal history in DB/Redis. Does not touch open positions or wallet."""
-    deleted = {"option_trades": 0, "ai_decisions": 0, "risk_events": 0}
+    """Wipe trade + AI signal + log history in DB/Redis. Does not touch open positions or wallet."""
+    deleted = {"option_trades": 0, "ai_decisions": 0, "risk_events": 0, "redis_logs": False, "redis_signals": False}
     if pg_pool:
         for table in ("option_trades", "ai_decisions", "risk_events"):
             row = await pg_pool.fetchrow(f"SELECT COUNT(*)::int AS n FROM {table}")
@@ -308,9 +308,8 @@ async def clear_history():
             await pg_pool.execute(f"TRUNCATE TABLE {table} RESTART IDENTITY")
             deleted[table] = n
     if rd:
-        await rd.delete("greeks:signals")
-        # Keep recent ops logs; truncate deep history only
-        await rd.ltrim("greeks:logs", 0, 49)
+        deleted["redis_signals"] = bool(await rd.delete("greeks:signals"))
+        deleted["redis_logs"] = bool(await rd.delete("greeks:logs"))
     return {"ok": True, "deleted": deleted}
 
 
