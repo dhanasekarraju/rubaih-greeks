@@ -459,7 +459,38 @@ export default function App() {
 
         {activeTab === 'trades' && (
           <View style={styles.card}>
-            <Text style={styles.cardTitle}>Recent trades</Text>
+            <View style={styles.rowBetween}>
+              <Text style={[styles.cardTitle, { marginBottom: 0 }]}>Recent trades</Text>
+              <TouchableOpacity
+                style={styles.clearBtn}
+                onPress={() => {
+                  Alert.alert(
+                    'Clear history',
+                    'Delete saved trades and AI signals from the app? Does not close open Delta positions.',
+                    [
+                      { text: 'Cancel', style: 'cancel' },
+                      {
+                        text: 'Clear',
+                        style: 'destructive',
+                        onPress: async () => {
+                          try {
+                            await apiFetch('/clear-history', { method: 'POST' });
+                            setTrades([]);
+                            setSignals([]);
+                            setTimeout(refresh, 500);
+                          } catch (e) {
+                            Alert.alert('Clear failed', String(e?.message || e));
+                          }
+                        },
+                      },
+                    ],
+                  );
+                }}
+                activeOpacity={0.8}
+              >
+                <Text style={styles.secondaryText}>Clear</Text>
+              </TouchableOpacity>
+            </View>
             {trades.length === 0 ? (
               <Text style={styles.help}>No trades yet</Text>
             ) : (
@@ -549,6 +580,14 @@ const styles = StyleSheet.create({
   cardTitle: { color: C.text, fontSize: 15, fontWeight: '700', marginBottom: 10 },
   help: { color: C.muted, fontSize: 12, lineHeight: 18, marginTop: 8 },
   row: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 8, alignItems: 'flex-start' },
+  rowBetween: {
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10,
+  },
+  clearBtn: {
+    borderColor: C.accent, borderWidth: 1, borderRadius: 10,
+    paddingVertical: 8, paddingHorizontal: 12, minHeight: 36,
+    alignItems: 'center', justifyContent: 'center',
+  },
   rowLabel: { color: C.muted, fontSize: 13, flexShrink: 0, paddingRight: 8 },
   rowValue: { color: C.text, fontSize: 13, fontWeight: '600', flex: 1, textAlign: 'right', flexWrap: 'wrap' },
   label: { color: C.muted, fontSize: 12, marginBottom: 6, marginTop: 8 },
