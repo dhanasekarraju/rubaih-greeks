@@ -124,6 +124,15 @@ async def dashboard():
                 data["free_capital_inr"] = settings["free_capital_inr"]
         if not data.get("capital_source") and settings.get("capital_source"):
             data["capital_source"] = settings["capital_source"]
+        halted = (await rd.get("greeks:halted") or "").strip() in ("1", "true", "yes")
+        data["halted"] = bool(data.get("halted")) or halted
+        if data["halted"] and not data.get("halt_reason"):
+            raw_h = await rd.get("greeks:halt_reason")
+            if raw_h:
+                try:
+                    data["halt_reason"] = json.loads(raw_h).get("reason") or raw_h
+                except Exception:
+                    data["halt_reason"] = raw_h
         ai_raw = await rd.get("greeks:ai_last")
         if ai_raw and not data.get("ai_last_action"):
             try:
@@ -141,6 +150,7 @@ async def settings():
     t = CFG.get("trading", {})
     stored = await rd.hgetall("greeks:settings") if rd else {}
     free = stored.get("free_capital_inr") or str(t.get("capital_inr", 1000))
+    risk = CFG.get("risk") or {}
     return {
         "mode": "options_cycle",
         "exchange": "delta",
@@ -149,15 +159,21 @@ async def settings():
         "capital_inr": str(t.get("capital_inr", 1000)),
         "free_capital_inr": free,
         "capital_source": stored.get("capital_source", "unknown"),
-        "margin_use_frac": str(t.get("margin_use_frac", 0.55)),
-        "margin_use_max_frac": str(t.get("margin_use_max_frac", 0.60)),
-        "take_profit_premium_pct": str(s.get("take_profit_premium_pct", 0.25)),
-        "stop_loss_premium_pct": str(s.get("stop_loss_premium_pct", 0.12)),
-        "tp_display": f"Premium +{float(s.get('take_profit_premium_pct', 0.25))*100:.0f}%",
-        "sl_display": f"Premium −{float(s.get('stop_loss_premium_pct', 0.12))*100:.0f}%",
-        "trail_arm_r": str(s.get("trail_arm_r", 0.5)),
-        "min_dte_days": str(s.get("min_dte_days", 1)),
-        "max_dte_days": str(s.get("max_dte_days", 7)),
+        "margin_use_frac": str(t.get("margin_use_frac", 0.20)),
+        "margin_use_max_frac": str(t.get("margin_use_max_frac", 0.25)),
+        "max_premium_budget_usdt": str(t.get("max_premium_budget_usdt", 2.0)),
+        "take_profit_premium_pct": str(s.get("take_profit_premium_pct", 0.35)),
+        "stop_loss_premium_pct": str(s.get("stop_loss_premium_pct", 0.18)),
+        "tp_display": f"Premium +{float(s.get('take_profit_premium_pct', 0.35))*100:.0f}%",
+        "sl_display": f"Premium −{float(s.get('stop_loss_premium_pct', 0.18))*100:.0f}%",
+        "trail_arm_r": str(s.get("trail_arm_r", 0.7)),
+        "max_hold_sec": str(s.get("max_hold_sec", 14400)),
+        "min_dte_days": str(s.get("min_dte_days", 2)),
+        "max_dte_days": str(s.get("max_dte_days", 5)),
+        "min_delta": str(s.get("min_delta", 0.30)),
+        "max_delta": str(s.get("max_delta", 0.55)),
+        "max_drawdown_pct": str(risk.get("max_drawdown_pct", 0.15)),
+        "max_daily_loss_frac": str(risk.get("max_daily_loss_frac", 0.25)),
         "allow_sell_premium": str(bool(t.get("allow_sell_premium", False))).lower(),
         "ai_emergency_conf": "0.95",
         "ai_note": "ENTER/EXIT advisory only; EMERGENCY acts only if confidence > 0.95",
@@ -247,6 +263,7 @@ async def get_balance():
         "ts": wallet.get("ts"),
         "balances": wallet.get("balances") or [],
         "live_trading": LIVE,
+        "halted": (await rd.get("greeks:halted") or "").strip() in ("1", "true", "yes") if rd else False,
     }
 
 
@@ -262,6 +279,22 @@ async def refresh_capital():
     if rd:
         await rd.rpush("greeks:commands", "refresh_capital")
     return {"ok": True, "queued": "refresh_capital"}
+
+
+@app.post("/api/resume", dependencies=[Depends(require_token)])
+async def resume():
+    """Clear risk halt so the engine may enter again (resets DD baseline)."""
+    if rd:
+        await rd.rpush("greeks:commands", "resume")
+    return {"ok": True, "queued": "resume"}
+
+
+@app.post("/api/sync-positions", dependencies=[Depends(require_token)])
+async def sync_positions():
+    """Force Delta↔local open-trade sync (clears ghost if Delta is flat)."""
+    if rd:
+        await rd.rpush("greeks:commands", "sync")
+    return {"ok": True, "queued": "sync"}
 
 
 @app.websocket("/ws")

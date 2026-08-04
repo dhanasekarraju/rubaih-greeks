@@ -27,7 +27,7 @@ import yaml
 from dotenv import load_dotenv
 
 from ai_advisor import GreeksAI, AIDecision, ai_configured
-from delta_client import DeltaClient, env_delta_client
+from delta_client import DeltaClient, DeltaAPIError, env_delta_client
 
 load_dotenv()
 
@@ -66,6 +66,7 @@ class OptionCandidate:
     spread_pct: float
     contract_value: float = 1.0
     unit_cost: float = 0.0  # approx quote currency cost for 1 contract
+    delta: float = 0.0  # raw signed delta from exchange
     score: float = 0.0
 
 
@@ -104,33 +105,42 @@ class Signal:
 
 
 class OptionsCycle:
-    """Scan liquid near-ATM options; exit on premium TP/SL/trail."""
+    """Scan liquid near-ATM options; exit on premium TP/SL/trail/time."""
 
     def __init__(self, cfg: Dict):
         t = cfg.get("trading") or {}
         s = t.get("strategy") or {}
+        r = cfg.get("risk") or {}
         self.underlyings = [u.upper() for u in (t.get("underlyings") or ["BTC", "ETH"])]
         self.allow_sell_premium = bool(t.get("allow_sell_premium", False))
         self.capital_inr = float(t.get("capital_inr", 1000))
         self.usdt_inr = float(t.get("usdt_inr", 87))
         self.free_capital_inr = self.capital_inr
-        self.margin_use_frac = float(t.get("margin_use_frac", 0.55))
-        self.margin_use_max_frac = float(t.get("margin_use_max_frac", 0.60))
-        self.min_interval = float(t.get("min_entry_interval_sec", 60))
-        self.entry_cooldown = float(s.get("entry_cooldown_sec", 90))
+        self.margin_use_frac = float(t.get("margin_use_frac", 0.20))
+        self.margin_use_max_frac = float(t.get("margin_use_max_frac", 0.25))
+        self.max_premium_budget = float(t.get("max_premium_budget_usdt", 2.0))
+        self.min_interval = float(t.get("min_entry_interval_sec", 120))
+        self.entry_cooldown = float(s.get("entry_cooldown_sec", 300))
         self.lookback = int(s.get("momentum_lookback", 20))
-        self.entry_move_pct = float(s.get("entry_move_pct", 0.0015))
-        self.min_dte = float(s.get("min_dte_days", 1))
-        self.max_dte = float(s.get("max_dte_days", 7))
-        self.atm_band = float(s.get("atm_band_pct", 0.02))
-        self.max_spread = float(s.get("max_spread_pct", 0.08))
+        self.entry_move_pct = float(s.get("entry_move_pct", 0.003))
+        self.min_dte = float(s.get("min_dte_days", 2))
+        self.max_dte = float(s.get("max_dte_days", 5))
+        self.atm_band = float(s.get("atm_band_pct", 0.015))
+        self.max_spread = float(s.get("max_spread_pct", 0.05))
         self.min_mark = float(s.get("min_mark_premium", 0.5))
-        self.tp_pct = float(s.get("take_profit_premium_pct", 0.25))
-        self.sl_pct = float(s.get("stop_loss_premium_pct", 0.12))
-        self.max_loss_frac = float(s.get("max_loss_frac", 0.15))
-        self.trail_arm_r = float(s.get("trail_arm_r", 0.5))
+        self.min_delta = float(s.get("min_delta", 0.30))
+        self.max_delta = float(s.get("max_delta", 0.55))
+        self.target_delta = float(s.get("target_delta", 0.40))
+        self.tp_pct = float(s.get("take_profit_premium_pct", 0.35))
+        self.sl_pct = float(s.get("stop_loss_premium_pct", 0.18))
+        self.max_loss_frac = float(s.get("max_loss_frac", 0.10))
+        self.trail_arm_r = float(s.get("trail_arm_r", 0.7))
         self.trail_giveback_r = float(s.get("trail_giveback_r", 0.4))
         self.trail_giveback_of_peak = float(s.get("trail_giveback_of_peak", 0.25))
+        self.max_hold_sec = float(s.get("max_hold_sec", 14400))
+        self.max_drawdown_pct = float(r.get("max_drawdown_pct", 0.15))
+        self.max_daily_loss_frac = float(r.get("max_daily_loss_frac", 0.25))
+        self.kill_on_drawdown = bool(r.get("kill_switch_on_drawdown", True))
         self.taker_fee = float((cfg.get("exchange") or {}).get("taker_fee", 0.0005))
         self._spot_hist: Dict[str, List[float]] = {u: [] for u in self.underlyings}
         self._last_signal = 0.0
@@ -146,7 +156,11 @@ class OptionsCycle:
         lo = max(0.05, min(self.margin_use_frac, self.margin_use_max_frac))
         hi = max(lo, min(0.95, self.margin_use_max_frac))
         use = min(max(self.margin_use_frac, lo), hi)
-        return free * use
+        raw = free * use
+        cap = float(self.max_premium_budget or 0)
+        if cap > 0:
+            return min(raw, cap)
+        return raw
 
     def note_spot(self, underlying: str, spot: float):
         if spot <= 0:
@@ -254,6 +268,7 @@ class OptionsCycle:
         dte = self._dte_days(row, symbol)
         if dte < 0:
             return None
+        delta = _f(greeks.get("delta") or row.get("delta"))
         return OptionCandidate(
             symbol=symbol,
             product_id=pid,
@@ -268,6 +283,7 @@ class OptionsCycle:
             spread_pct=spread,
             contract_value=cval,
             unit_cost=unit_cost,
+            delta=delta,
         )
 
     def filter_rank(self, cands: List[OptionCandidate]) -> List[OptionCandidate]:
@@ -282,19 +298,33 @@ class OptionsCycle:
             moneyness = abs(c.strike - c.spot) / c.spot
             if moneyness > self.atm_band * 2.5:
                 continue
+            # Signed delta → abs band for puts/calls
+            abs_delta = abs(c.delta) if c.delta != 0 else 0.0
+            if abs_delta > 0 and (abs_delta < self.min_delta or abs_delta > self.max_delta):
+                continue
+            # If exchange omits delta, still allow near-ATM (moneyness already gated)
             mom = self.momentum(c.underlying)
-            # Directional: up → calls, down → puts; flat → skip weak
             if mom >= self.entry_move_pct and c.option_type != "call":
                 continue
             if mom <= -self.entry_move_pct and c.option_type != "put":
                 continue
             if abs(mom) < self.entry_move_pct:
                 continue
-            # Prefer tighter spread, closer ATM, mid DTE
+            # Prefer mid-delta ~target, tight spread, DTE ~3d, closer ATM
             atm_score = 1.0 / (1e-6 + moneyness)
             spread_score = 1.0 / (1e-6 + c.spread_pct)
             dte_score = 1.0 - abs((c.dte_days - 3.0) / max(self.max_dte, 1))
-            c.score = atm_score * 2 + spread_score + max(0.0, dte_score) + abs(mom) * 50
+            if abs_delta > 0:
+                delta_score = 1.0 / (1e-6 + abs(abs_delta - self.target_delta))
+            else:
+                delta_score = 0.5
+            c.score = (
+                atm_score * 2
+                + spread_score
+                + max(0.0, dte_score)
+                + delta_score * 1.5
+                + abs(mom) * 40
+            )
             ranked.append(c)
         ranked.sort(key=lambda x: x.score, reverse=True)
         return ranked
@@ -362,8 +392,8 @@ class OptionsCycle:
             reason=(
                 f"ENTRY_{best.option_type.upper()}: {best.symbol} mom={mom:+.2%} "
                 f"spot={best.spot:.2f} K={best.strike:.2f} dte={best.dte_days:.1f}d "
-                f"mark={px:.4f} unit≈{unit_cost:.2f} size={size} budget=₹{self.budget():.0f} "
-                f"TP=+{self.tp_pct:.0%} SL=-{self.sl_pct:.0%}"
+                f"delta={best.delta:+.2f} mark={px:.4f} unit≈{unit_cost:.2f} size={size} "
+                f"budget={self.budget():.2f} TP=+{self.tp_pct:.0%} SL=-{self.sl_pct:.0%}"
             ),
         )
 
@@ -462,10 +492,11 @@ class OptionsCycle:
         now = time.time()
         if now - self._last_hold_log > 8:
             self._last_hold_log = now
+            held = now - t.entry_ts
             print(
-                f"[HOLD] {t.symbol} mark={mark:.4f} pnl=₹{pnl:.0f} peak=₹{t.peak_pnl:.0f} "
-                f"giveback=₹{giveback:.0f}/{giveback_need:.0f} TP={t.tp:.4f} SL={t.sl:.4f} "
-                f"maxloss=₹{max_loss:.0f} 1R=₹{t.r_inr:.0f} fees~₹{fees:.0f} "
+                f"[HOLD] {t.symbol} mark={mark:.4f} pnl={pnl:.2f} peak={t.peak_pnl:.2f} "
+                f"giveback={giveback:.2f}/{giveback_need:.2f} TP={t.tp:.4f} SL={t.sl:.4f} "
+                f"maxloss={max_loss:.2f} held={held:.0f}s/{self.max_hold_sec:.0f}s "
                 f"trail={'ON' if t.peak_pnl >= arm else 'off'}"
             )
 
@@ -484,16 +515,21 @@ class OptionsCycle:
                 reason=reason,
             )
 
+        if self.max_hold_sec > 0 and (now - t.entry_ts) >= self.max_hold_sec:
+            return _sell(
+                f"EXIT_TIME: {t.symbol} held={now - t.entry_ts:.0f}s "
+                f">= {self.max_hold_sec:.0f}s pnl={pnl:.2f}"
+            )
         if mark >= t.tp:
-            return _sell(f"EXIT_TP: {t.symbol} mark>={t.tp:.4f} pnl=₹{pnl:.0f}")
+            return _sell(f"EXIT_TP: {t.symbol} mark>={t.tp:.4f} pnl={pnl:.2f}")
         if mark <= t.sl:
-            return _sell(f"EXIT_SL: {t.symbol} mark<={t.sl:.4f} pnl=₹{pnl:.0f}")
+            return _sell(f"EXIT_SL: {t.symbol} mark<={t.sl:.4f} pnl={pnl:.2f}")
         if pnl <= -abs(max_loss):
-            return _sell(f"EXIT_MAXLOSS: {t.symbol} pnl=₹{pnl:.0f}")
+            return _sell(f"EXIT_MAXLOSS: {t.symbol} pnl={pnl:.2f}")
         if t.peak_pnl >= arm and pnl >= fees and giveback >= giveback_need:
             return _sell(
-                f"EXIT_TRAIL: {t.symbol} peak=₹{t.peak_pnl:.0f} now=₹{pnl:.0f} "
-                f"giveback=₹{giveback:.0f}"
+                f"EXIT_TRAIL: {t.symbol} peak={t.peak_pnl:.2f} now={pnl:.2f} "
+                f"giveback={giveback:.2f}"
             )
         return None
 
@@ -570,6 +606,47 @@ class Store:
             return {}
         raw = await self.rd.get("greeks:capital_ledger")
         return json.loads(raw) if raw else {}
+
+    async def is_halted(self) -> bool:
+        if not self.rd:
+            return False
+        return (await self.rd.get("greeks:halted") or "").strip() in ("1", "true", "yes")
+
+    async def set_halted(self, halted: bool, reason: str = ""):
+        if not self.rd:
+            return
+        if halted:
+            await self.rd.set("greeks:halted", "1")
+            await self.rd.set(
+                "greeks:halt_reason",
+                json.dumps({"reason": reason, "ts": time.time()}),
+            )
+            await self.set_status("halted", reason)
+        else:
+            await self.rd.delete("greeks:halted")
+            await self.rd.delete("greeks:halt_reason")
+
+    async def get_halt_reason(self) -> str:
+        if not self.rd:
+            return ""
+        raw = await self.rd.get("greeks:halt_reason")
+        if not raw:
+            return ""
+        try:
+            return str(json.loads(raw).get("reason") or "")
+        except Exception:
+            return str(raw)
+
+    async def load_risk_state(self) -> Dict:
+        if not self.rd:
+            return {}
+        raw = await self.rd.get("greeks:risk_state")
+        return json.loads(raw) if raw else {}
+
+    async def save_risk_state(self, state: Dict):
+        if not self.rd:
+            return
+        await self.rd.set("greeks:risk_state", json.dumps(state))
 
     async def publish_dashboard(self, snap: Dict):
         if not self.rd:
@@ -694,6 +771,13 @@ class GreeksEngine:
         self._last_capital_refresh = 0.0
         self._ai_last: Optional[Dict] = None
         self._mark_cache: Dict[str, float] = {}
+        self._delta_cache: Dict[str, float] = {}
+        self._halted = False
+        self._halt_reason = ""
+        self._peak_free = 0.0
+        self._day_start_free = 0.0
+        self._day_key = ""
+        self._drawdown_pct = 0.0
 
     async def _log(self, line: str):
         print(line)
@@ -708,24 +792,40 @@ class GreeksEngine:
         plan = await self.store.load_trade_plan()
         self.cycle.restore(plan)
         await self._refresh_capital(force=True)
+        await self._load_halt_state()
         auth = False
         if self.client.api_key:
             auth = await self.client.ping_auth()
         await self._log("=" * 60)
-        await self._log(" RUBAIH GREEKS — Delta options cycle")
+        await self._log(" RUBAIH GREEKS — Delta options cycle (capital survival)")
         await self._log(f" LIVE_TRADING: {'ON' if self._live else 'OFF (dry-run)'}")
         await self._log(f" Delta auth: {'OK' if auth else 'NO / missing keys'}")
         await self._log(f" AI: {'ENABLED (OpenRouter→NVIDIA)' if self._ai_enabled else 'DISABLED'}")
-        await self._log(f" Free capital: {self.cycle.free_capital_inr:.2f} ({self._capital_source})")
+        await self._log(
+            f" Free: {self.cycle.free_capital_inr:.4f} {self._quote_ccy} "
+            f"budget={self.cycle.budget():.4f} cap={self.cycle.max_premium_budget:.2f}"
+        )
+        await self._log(
+            f" Filters: DTE {self.cycle.min_dte:.0f}-{self.cycle.max_dte:.0f}d "
+            f"delta {self.cycle.min_delta:.2f}-{self.cycle.max_delta:.2f} "
+            f"mom>={self.cycle.entry_move_pct:.2%}"
+        )
         await self._log(
             f" Exits: TP=+{self.cycle.tp_pct:.0%} SL=-{self.cycle.sl_pct:.0%} "
-            f"trail={self.cycle.trail_arm_r}R underlyings={self.cycle.underlyings}"
+            f"trail={self.cycle.trail_arm_r}R max_hold={self.cycle.max_hold_sec:.0f}s"
+        )
+        await self._log(
+            f" Risk: max_dd={self.cycle.max_drawdown_pct:.0%} "
+            f"daily_loss={self.cycle.max_daily_loss_frac:.0%} "
+            f"halted={self._halted}"
         )
         await self._log(" AI conf: advisory only; EMERGENCY acts only if conf>0.95")
         await self._log("=" * 60)
         if self._live and not auth:
             await self._log("[WARN] LIVE on but Delta auth failed — orders blocked")
-        await self.store.set_status("running")
+        if self._halted:
+            await self._log(f"[HALT] Active — no new entries. Reason: {self._halt_reason or 'n/a'}")
+        await self.store.set_status("halted" if self._halted else "running")
         tasks = [
             self.main_loop(),
             self.sync_loop(),
@@ -811,6 +911,114 @@ class GreeksEngine:
             await self._log(
                 f"[CAPITAL] free={free:.4f} {quote_ccy} (≈₹{inr:.0f}) source={source}"
             )
+        await self._update_risk_after_capital(free)
+
+    async def _load_halt_state(self):
+        self._halted = await self.store.is_halted()
+        self._halt_reason = await self.store.get_halt_reason() if self._halted else ""
+        state = await self.store.load_risk_state()
+        self._peak_free = _f(state.get("peak_free"))
+        self._day_start_free = _f(state.get("day_start_free"))
+        self._day_key = str(state.get("day_key") or "")
+        self._drawdown_pct = _f(state.get("drawdown_pct"))
+
+    async def _persist_risk_state(self):
+        await self.store.save_risk_state(
+            {
+                "peak_free": self._peak_free,
+                "day_start_free": self._day_start_free,
+                "day_key": self._day_key,
+                "drawdown_pct": self._drawdown_pct,
+                "ts": time.time(),
+            }
+        )
+
+    async def _update_risk_after_capital(self, free: float):
+        """Track peak/daily equity; halt on drawdown or daily loss (survives restart)."""
+        if free <= 0:
+            return
+        day_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if day_key != self._day_key or self._day_start_free <= 0:
+            self._day_key = day_key
+            self._day_start_free = free
+            if self._peak_free <= 0:
+                self._peak_free = free
+            await self._persist_risk_state()
+            await self._log(
+                f"[RISK] day start free={free:.4f} {self._quote_ccy} peak={self._peak_free:.4f}"
+            )
+
+        if free > self._peak_free:
+            self._peak_free = free
+        self._drawdown_pct = (
+            (self._peak_free - free) / self._peak_free if self._peak_free > 0 else 0.0
+        )
+        daily_loss_frac = (
+            (self._day_start_free - free) / self._day_start_free
+            if self._day_start_free > 0
+            else 0.0
+        )
+        await self._persist_risk_state()
+
+        if self._halted:
+            return
+        if not self.cycle.kill_on_drawdown:
+            return
+
+        reason = ""
+        if self._drawdown_pct >= self.cycle.max_drawdown_pct:
+            reason = (
+                f"drawdown {self._drawdown_pct:.1%} >= "
+                f"{self.cycle.max_drawdown_pct:.1%} (peak={self._peak_free:.4f})"
+            )
+        elif daily_loss_frac >= self.cycle.max_daily_loss_frac:
+            reason = (
+                f"daily loss {daily_loss_frac:.1%} >= "
+                f"{self.cycle.max_daily_loss_frac:.1%} "
+                f"(day_start={self._day_start_free:.4f})"
+            )
+        if reason:
+            await self._trigger_halt(reason)
+
+    async def _trigger_halt(self, reason: str):
+        if self._halted:
+            return
+        self._halted = True
+        self._halt_reason = reason
+        await self.store.set_halted(True, reason)
+        await self._log(f"[HALT] {reason} — flatten open trade; block new entries until resume")
+        t = self.cycle.trade
+        if t:
+            mark = self._mark_cache.get(t.symbol, t.entry_premium)
+            sig = Signal(
+                action="SELL",
+                symbol=t.symbol,
+                product_id=t.product_id,
+                size=t.size,
+                premium=mark if mark > 0 else t.entry_premium,
+                underlying=t.underlying,
+                option_type=t.option_type,
+                strike=t.strike,
+                contract_value=t.contract_value,
+                reason=f"EXIT_HALT: {reason}",
+            )
+            await self._execute(sig)
+        await self.store.set_status("halted", reason)
+
+    async def _clear_halt(self):
+        self._halted = False
+        self._halt_reason = ""
+        await self.store.set_halted(False)
+        # Reset peak/day baseline to current free so we don't immediately re-halt
+        free = float(self.cycle.free_capital_inr or 0)
+        if free > 0:
+            self._peak_free = free
+            self._day_start_free = free
+            self._day_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            self._drawdown_pct = 0.0
+            await self._persist_risk_state()
+        await self.store.set_status("running")
+        await self._log("[HALT] Cleared — entries allowed again (risk baseline reset)")
 
     async def _publish(self):
         t = self.cycle.trade
@@ -832,6 +1040,11 @@ class GreeksEngine:
             "budget_quote": self.cycle.budget(),
             "capital_source": self._capital_source,
             "session_pnl": self._session_pnl + upnl,
+            "halted": self._halted,
+            "halt_reason": self._halt_reason,
+            "drawdown_pct": self._drawdown_pct,
+            "peak_free": self._peak_free,
+            "day_start_free": self._day_start_free,
             "ai_enabled": self._ai_enabled,
             "ai_last_action": (self._ai_last or {}).get("action"),
             "ai_confidence": (self._ai_last or {}).get("confidence"),
@@ -849,11 +1062,33 @@ class GreeksEngine:
                 "underlying": t.underlying,
                 "option_type": t.option_type,
                 "strike": t.strike,
+                "delta": self._delta_cache.get(t.symbol),
             },
             "tp_display": f"Premium +{self.cycle.tp_pct*100:.0f}%",
             "sl_display": f"Premium −{self.cycle.sl_pct*100:.0f}%",
+            "max_hold_sec": self.cycle.max_hold_sec,
         }
         await self.store.publish_dashboard(snap)
+
+    async def _clear_external_flat(self, reason: str, refresh_wallet: bool = True):
+        """Delta already flat (manual close / reduce_only empty) — drop local ghost."""
+        t = self.cycle.trade
+        sym = t.symbol if t else "?"
+        await self._log(f"[SYNC] Clearing local trade {sym} — {reason}")
+        self.cycle.clear()
+        self._last_flatten_ts = time.time()
+        self._last_fill_ts = 0.0
+        await self.store.save_trade_plan({})
+        if refresh_wallet:
+            await self._refresh_capital(force=True)
+        else:
+            await self.store.save_capital(
+                self.cycle.free_capital_inr,
+                "ledger",
+                getattr(self, "_quote_ccy", "USDT"),
+                self.cycle.usdt_inr,
+            )
+        await self._publish()
 
     async def _execute(self, sig: Signal):
         await self._log(f"[SIGNAL] {sig.reason}")
@@ -879,6 +1114,16 @@ class GreeksEngine:
                 await self._log(f"[FILL] LIVE {sig.action} {sig.symbol} size={sig.size}")
             except Exception as e:
                 await self._log(f"[ORDER] failed: {e}")
+                code = getattr(e, "code", "") or ""
+                text = str(e).lower()
+                # Manual close on Delta / already flat — stop EXIT loops
+                if sig.action == "SELL" and (
+                    code == "no_position_for_reduce_only"
+                    or "no_position_for_reduce_only" in text
+                ):
+                    await self._clear_external_flat(
+                        "Delta no_position_for_reduce_only (already flat)"
+                    )
                 return
         else:
             await self._log(f"[DRY] {sig.action} {sig.symbol} size={sig.size} @ {fill_px:.4f}")
@@ -925,6 +1170,8 @@ class GreeksEngine:
             await self._log(
                 f"[FLAT] pnl≈{pnl:.2f} free={self.cycle.free_capital_inr:.2f}"
             )
+            # Authoritative free from Delta after exit
+            await self._refresh_capital(force=True)
 
     async def main_loop(self):
         while self._running:
@@ -944,11 +1191,23 @@ class GreeksEngine:
                             mark = _f(tk.get("mark_price") or (tk.get("quotes") or {}).get("mark_price"))
                             if mark > 0:
                                 self._mark_cache[sym] = mark
-                            exit_sig = self.cycle.evaluate_exit(mark if mark > 0 else self._mark_cache.get(sym, 0))
+                            g = tk.get("greeks") or {}
+                            dlt = _f(g.get("delta") or tk.get("delta"))
+                            if dlt != 0:
+                                self._delta_cache[sym] = dlt
+                            exit_sig = self.cycle.evaluate_exit(
+                                mark if mark > 0 else self._mark_cache.get(sym, 0)
+                            )
                             if exit_sig:
                                 await self._execute(exit_sig)
                     except Exception as e:
                         await self._log(f"[MARK] {sym}: {e}")
+                elif self._halted:
+                    if int(time.time()) % 90 < 3:
+                        await self._log(
+                            f"[HALT] blocked entries — {self._halt_reason or 'risk'} "
+                            f"(POST /api/resume to clear)"
+                        )
                 else:
                     entry = self.cycle.pick_entry(tickers or [])
                     if entry:
@@ -956,7 +1215,7 @@ class GreeksEngine:
                     elif int(time.time()) % 60 < 3:
                         await self._log(
                             f"[SCAN] candidates from {len(tickers or [])} tickers | "
-                            f"free={self.cycle.free_capital_inr:.2f} budget={self.cycle.budget():.2f}"
+                            f"free={self.cycle.free_capital_inr:.4f} budget={self.cycle.budget():.4f}"
                         )
                 await self._publish()
             except Exception as e:
@@ -964,48 +1223,60 @@ class GreeksEngine:
             await asyncio.sleep(3)
 
     async def sync_loop(self):
-        """Detect Delta flat / manual close; clear local ghost."""
+        """Keep local open trade aligned with Delta (manual open/close)."""
         while self._running:
             try:
-                if not (self.client and self.client._auth_ok and self.cycle.trade):
+                if not (self.client and self.client._auth_ok):
                     await asyncio.sleep(5)
                     continue
-                positions = await self.client.get_positions()
-                open_pids = set()
-                matched_size = 0
-                for p in positions or []:
-                    pid = int(p.get("product_id") or (p.get("product") or {}).get("id") or 0)
-                    size = int(_f(p.get("size") or p.get("position_size")))
-                    if pid and abs(size) > 0:
-                        open_pids.add(pid)
-                    if pid == self.cycle.trade.product_id:
-                        matched_size = size
-                ghost = matched_size == 0 and (
-                    self.cycle.trade.product_id not in open_pids
-                    and time.time() - self._last_fill_ts > 12
-                )
-                if ghost:
-                    t = self.cycle.trade
-                    mark = self._mark_cache.get(t.symbol, t.entry_premium)
-                    cval = float(t.contract_value or 1.0)
-                    pnl = (mark - t.entry_premium) * t.size * cval
-                    await self._log(
-                        f"[SYNC] Delta flat for {t.symbol} — manual/external close "
-                        f"(pnl≈{pnl:.2f})"
+
+                # Always poll Delta when we think we have a local trade
+                if self.cycle.trade:
+                    pid = int(self.cycle.trade.product_id or 0)
+                    try:
+                        positions = await self.client.get_positions(product_id=pid or None)
+                    except Exception as e:
+                        await self._log(f"[SYNC] positions: {e}")
+                        await asyncio.sleep(8)
+                        continue
+
+                    matched_size = 0
+                    open_pids = set()
+                    for p in positions or []:
+                        p_pid = int(
+                            p.get("product_id")
+                            or (p.get("product") or {}).get("id")
+                            or 0
+                        )
+                        size = int(_f(p.get("size") or p.get("position_size")))
+                        if p_pid and abs(size) > 0:
+                            open_pids.add(p_pid)
+                        if pid and p_pid == pid:
+                            matched_size = size
+
+                    # Restored plans after restart: _last_fill_ts may be 0 — still clear if Delta flat
+                    age_ok = (
+                        self._last_fill_ts <= 0
+                        or time.time() - self._last_fill_ts > 8
                     )
-                    self.cycle.set_free_capital(
-                        max(0.0, self.cycle.free_capital_inr + t.premium_budget + pnl)
+                    ghost = age_ok and abs(matched_size) == 0 and (
+                        not pid or pid not in open_pids
                     )
-                    self._session_pnl += pnl
-                    self.cycle.clear()
-                    self._last_flatten_ts = time.time()
-                    await self.store.save_trade_plan({})
-                    await self.store.save_capital(
-                        self.cycle.free_capital_inr,
-                        "ledger",
-                        getattr(self, "_quote_ccy", "USDT"),
-                        self.cycle.usdt_inr,
-                    )
+                    if ghost:
+                        await self._clear_external_flat(
+                            "Delta position size=0 (manual/external close)"
+                        )
+                    elif abs(matched_size) > 0 and abs(matched_size) != abs(
+                        int(self.cycle.trade.size or 0)
+                    ):
+                        # Size changed on exchange — adopt Delta size
+                        self.cycle.trade.size = abs(int(matched_size))
+                        await self.store.save_trade_plan(self.cycle.trade_plan_dict())
+                        await self._log(
+                            f"[SYNC] size aligned to Delta → {self.cycle.trade.size} "
+                            f"on {self.cycle.trade.symbol}"
+                        )
+
                 await asyncio.sleep(5)
             except Exception as e:
                 await self._log(f"[SYNC] {e}")
@@ -1024,6 +1295,50 @@ class GreeksEngine:
                     await self._emergency("operator")
                 elif cmd == "refresh_capital":
                     await self._refresh_capital(force=True)
+                    await self._publish()
+                elif cmd in ("resume", "unhalt", "clear_halt"):
+                    await self._log(f"[CMD] {cmd}")
+                    await self._clear_halt()
+                    await self._publish()
+                elif cmd in ("sync", "sync_positions", "clear_ghost"):
+                    await self._log(f"[CMD] {cmd}")
+                    if self.cycle.trade and self.client and self.client._auth_ok:
+                        pid = int(self.cycle.trade.product_id or 0)
+                        try:
+                            positions = await self.client.get_positions(product_id=pid or None)
+                            matched = 0
+                            for p in positions or []:
+                                p_pid = int(
+                                    p.get("product_id")
+                                    or (p.get("product") or {}).get("id")
+                                    or 0
+                                )
+                                size = int(_f(p.get("size") or p.get("position_size")))
+                                if pid and p_pid == pid:
+                                    matched = size
+                                    break
+                            if abs(matched) == 0:
+                                await self._clear_external_flat(
+                                    "forced sync — Delta flat"
+                                )
+                            else:
+                                await self._log(
+                                    f"[SYNC] Delta still open size={matched} "
+                                    f"on {self.cycle.trade.symbol}"
+                                )
+                        except Exception as e:
+                            # If sync API fails but user insists clear_ghost
+                            if cmd == "clear_ghost":
+                                await self._clear_external_flat(
+                                    f"forced clear_ghost after sync error: {e}",
+                                    refresh_wallet=True,
+                                )
+                            else:
+                                await self._log(f"[SYNC] cmd failed: {e}")
+                    elif self.cycle.trade and cmd == "clear_ghost":
+                        await self._clear_external_flat("forced clear_ghost")
+                    else:
+                        await self._log("[SYNC] no local trade to sync")
                     await self._publish()
             except Exception as e:
                 await self._log(f"[CMD] {e}")

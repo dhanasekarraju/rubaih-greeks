@@ -16,6 +16,29 @@ from urllib.parse import urlencode
 import aiohttp
 
 
+class DeltaAPIError(RuntimeError):
+    """Delta HTTP error with parsed code when available."""
+
+    def __init__(
+        self,
+        message: str,
+        status: int = 0,
+        payload: Optional[Dict] = None,
+        body_text: str = "",
+    ):
+        super().__init__(message)
+        self.status = status
+        self.payload = payload or {}
+        self.body_text = body_text or ""
+
+    @property
+    def code(self) -> str:
+        err = self.payload.get("error") if isinstance(self.payload, dict) else None
+        if isinstance(err, dict):
+            return str(err.get("code") or "")
+        return ""
+
+
 class DeltaClient:
     def __init__(
         self,
@@ -57,11 +80,19 @@ class DeltaClient:
         session = await self._get_session()
         query = ""
         if params:
-            query = "?" + urlencode({k: v for k, v in params.items() if v is not None})
+            # Delta signs with raw commas (not %2C). Keep commas unescaped.
+            query = "?" + urlencode(
+                {k: v for k, v in params.items() if v is not None},
+                safe=",",
+            )
         body_str = ""
         if body is not None:
             body_str = json.dumps(body, separators=(",", ":"))
-        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "rubaih-greeks/1.0",
+        }
         if auth:
             if not self.api_key or not self.api_secret:
                 raise RuntimeError("DELTA_API_KEY / DELTA_API_SECRET required")
@@ -74,14 +105,25 @@ class DeltaClient:
                 }
             )
         url = f"{self.base_url}{path}{query}"
-        async with session.request(method.upper(), url, data=body_str or None, headers=headers) as resp:
+        async with session.request(
+            method.upper(),
+            url,
+            data=body_str if body is not None else None,
+            headers=headers,
+        ) as resp:
             text = await resp.text()
             try:
                 data = json.loads(text) if text else {}
             except json.JSONDecodeError:
                 data = {"raw": text[:500]}
             if resp.status >= 400:
-                raise RuntimeError(f"Delta {method} {path} → {resp.status}: {text[:240]}")
+                err = DeltaAPIError(
+                    f"Delta {method} {path} → {resp.status}: {text[:240]}",
+                    status=resp.status,
+                    payload=data if isinstance(data, dict) else {},
+                    body_text=text,
+                )
+                raise err
             return data
 
     async def ping_auth(self) -> bool:
@@ -139,15 +181,35 @@ class DeltaClient:
         rows = data.get("result") or []
         return rows if isinstance(rows, list) else []
 
-    async def get_positions(self, contract_types: str = "call_options,put_options") -> List[Dict]:
-        data = await self.request(
-            "GET",
-            "/v2/positions/margined",
-            params={"contract_types": contract_types},
-            auth=True,
-        )
-        rows = data.get("result") or []
-        return rows if isinstance(rows, list) else []
+    async def get_positions(
+        self,
+        contract_types: str = "call_options,put_options",
+        product_id: Optional[int] = None,
+    ) -> List[Dict]:
+        # Prefer unfiltered margined first (avoids fragile multi-value query signing),
+        # then fall back to contract_types filter.
+        attempts: List[Optional[Dict[str, Any]]] = [None]
+        if product_id:
+            attempts.append({"product_id": str(int(product_id))})
+        if contract_types:
+            attempts.append({"contract_types": contract_types})
+        last_err: Optional[Exception] = None
+        for params in attempts:
+            try:
+                data = await self.request(
+                    "GET",
+                    "/v2/positions/margined",
+                    params=params,
+                    auth=True,
+                )
+                rows = data.get("result") or []
+                return rows if isinstance(rows, list) else []
+            except Exception as e:
+                last_err = e
+                continue
+        if last_err:
+            raise last_err
+        return []
 
     async def place_order(
         self,

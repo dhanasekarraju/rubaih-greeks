@@ -235,6 +235,24 @@ export default function App() {
     ]);
   };
 
+  const resumeHalt = () => {
+    Alert.alert('Resume trading', 'Clear risk halt and allow new entries? Baseline drawdown resets.', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Resume',
+        onPress: async () => {
+          try {
+            await apiFetch('/resume', { method: 'POST' });
+            Alert.alert('Queued', 'Resume sent — wait a few seconds');
+            setTimeout(refresh, 2000);
+          } catch (e) {
+            Alert.alert('Failed', String(e.message || e));
+          }
+        },
+      },
+    ]);
+  };
+
   if (!ready) {
     return (
       <SafeAreaView style={[styles.root, { justifyContent: 'center', alignItems: 'center' }]}>
@@ -246,6 +264,8 @@ export default function App() {
   const pos = dashboard?.position;
   const live = String(dashboard?.live_trading ?? settings?.live_trading ?? 'false') === 'true'
     || dashboard?.live === true;
+  const halted = dashboard?.halted === true || balance?.halted === true
+    || String(dashboard?.engine_status || '').toLowerCase() === 'halted';
   const free = balance?.free_quote ?? balance?.free_capital ?? dashboard?.free_quote
     ?? dashboard?.free_capital_inr ?? settings?.free_capital_inr;
   const quoteCcy = balance?.quote_ccy || dashboard?.quote_ccy || settings?.quote_ccy || 'USDT';
@@ -258,6 +278,9 @@ export default function App() {
     : `${fmt(free, 4)} ${quoteCcy}${freeInr != null && Number(freeInr) > 0 ? `  (≈ ₹${fmt(freeInr, 0)})` : ''}`;
   const budgetRaw = dashboard?.budget_quote ?? dashboard?.budget_inr;
   const budgetLabel = budgetRaw == null ? '—' : `${fmt(budgetRaw, 4)} ${quoteCcy}`;
+  const ddPct = dashboard?.drawdown_pct != null
+    ? `${(Number(dashboard.drawdown_pct) * 100).toFixed(1)}%`
+    : '—';
 
   return (
     <SafeAreaView style={styles.root}>
@@ -267,10 +290,17 @@ export default function App() {
           <Text style={styles.brand}>Rubaih Greeks</Text>
           <Text style={styles.sub}>Delta options · {connected ? 'online' : 'offline'}</Text>
         </View>
-        <View style={[styles.pill, { backgroundColor: live ? 'rgba(231,76,60,0.2)' : C.accentDim }]}>
-          <Text style={{ color: live ? C.bad : C.accent, fontWeight: '700', fontSize: 12 }}>
-            {live ? 'LIVE' : 'DRY-RUN'}
-          </Text>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+          {halted && (
+            <View style={[styles.pill, { backgroundColor: 'rgba(231,76,60,0.25)' }]}>
+              <Text style={{ color: C.bad, fontWeight: '700', fontSize: 12 }}>HALTED</Text>
+            </View>
+          )}
+          <View style={[styles.pill, { backgroundColor: live ? 'rgba(231,76,60,0.2)' : C.accentDim }]}>
+            <Text style={{ color: live ? C.bad : C.accent, fontWeight: '700', fontSize: 12 }}>
+              {live ? 'LIVE' : 'DRY-RUN'}
+            </Text>
+          </View>
         </View>
       </View>
 
@@ -306,15 +336,27 @@ export default function App() {
                 </Text>
               </View>
             )}
+            {halted && (
+              <View style={[styles.card, { borderColor: C.bad }]}>
+                <Text style={styles.cardTitle}>Risk halt</Text>
+                <Text style={styles.help}>
+                  {String(dashboard?.halt_reason || 'Drawdown / daily loss limit hit. No new entries until you resume.')}
+                </Text>
+                <TouchableOpacity style={styles.primaryBtn} onPress={resumeHalt} activeOpacity={0.8}>
+                  <Text style={styles.primaryText} numberOfLines={1}>Resume trading</Text>
+                </TouchableOpacity>
+              </View>
+            )}
             <View style={styles.card}>
               <Text style={styles.cardTitle}>Live account balance</Text>
               <Row label="Free (Delta)" value={freeLabel} />
               <Row label="Budget / trade" value={budgetLabel} />
+              <Row label="Drawdown" value={ddPct} />
               <Row label="Source" value={String(source)} />
               <Row label="Session PnL" value={`${fmt(dashboard?.session_pnl)} ${quoteCcy}`} />
               <Row label="Engine" value={String(dashboard?.engine_status || '—')} />
               <Text style={[styles.help, { marginTop: 6 }]}>
-                Delta options are USDT-quoted. ₹ is approximate (× usdt_inr) — same money as USDT, not a second balance.
+                Capital-survival mode: ~20% free / max 2 USDT per trade. ₹ is approx of USDT, not a second wallet.
               </Text>
               {walletRows.length > 0 && (
                 <View style={{ marginTop: 8 }}>
@@ -336,12 +378,15 @@ export default function App() {
             <View style={styles.card}>
               <Text style={styles.cardTitle}>Position</Text>
               {!pos ? (
-                <Text style={styles.help}>Flat — scanning BTC/ETH options</Text>
+                <Text style={styles.help}>
+                  {halted ? 'Flat — entries blocked (halted)' : 'Flat — scanning BTC/ETH (strict filters)'}
+                </Text>
               ) : (
                 <>
                   <Row label="Symbol" value={pos.symbol} />
                   <Row label="Type" value={`${pos.option_type} · K ${fmt(pos.strike, 0)}`} />
                   <Row label="Size" value={String(pos.size)} />
+                  <Row label="Delta" value={pos.delta != null ? fmt(pos.delta, 3) : '—'} />
                   <Row label="Entry" value={fmt(pos.entry, 4)} />
                   <Row label="Mark" value={fmt(pos.mark, 4)} />
                   <Row label="uPnL" value={fmt(pos.upnl)} />
@@ -362,8 +407,9 @@ export default function App() {
 
             <View style={styles.card}>
               <Text style={styles.cardTitle}>Exits</Text>
-              <Row label="Take profit" value={settings?.tp_display || 'Premium +25%'} />
-              <Row label="Stop loss" value={settings?.sl_display || 'Premium −12%'} />
+              <Row label="Take profit" value={settings?.tp_display || 'Premium +35%'} />
+              <Row label="Stop loss" value={settings?.sl_display || 'Premium −18%'} />
+              <Row label="Max hold" value={`${Math.round(Number(settings?.max_hold_sec || dashboard?.max_hold_sec || 14400) / 3600)}h`} />
               <Row label="Underlyings" value={settings?.underlyings || 'BTC,ETH'} />
             </View>
 
