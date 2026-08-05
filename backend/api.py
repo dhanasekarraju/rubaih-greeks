@@ -61,9 +61,13 @@ rd: Optional[aioredis.Redis] = None
 
 async def require_token(
     x_api_token: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
     token: Optional[str] = Query(default=None),
 ):
-    got = (x_api_token or token or "").strip()
+    bearer = ""
+    if authorization and authorization.strip().lower().startswith("bearer "):
+        bearer = authorization.strip()[7:]
+    got = (x_api_token or bearer or token or "").strip()
     if not TOKEN or got != TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
 
