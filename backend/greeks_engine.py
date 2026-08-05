@@ -957,8 +957,13 @@ class GreeksEngine:
         self._day_key = str(state.get("day_key") or "")
         self._drawdown_pct = _f(state.get("drawdown_pct"))
         self._halt_ts = _f(state.get("halt_ts"))
+        # A halt with no timestamp predates auto-resume and was computed on cash,
+        # not equity — drop it instead of serving a cooldown for a phantom loss.
         if self._halted and self._halt_ts <= 0:
-            self._halt_ts = time.time()
+            if self.cycle.auto_resume:
+                await self._clear_halt("stale halt from previous build")
+            else:
+                self._halt_ts = time.time()
 
     async def _persist_risk_state(self):
         await self.store.save_risk_state(
