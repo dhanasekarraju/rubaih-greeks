@@ -1109,6 +1109,24 @@ class GreeksEngine:
         # than serve a cooldown for a loss the bot never took.
         if self._halted and (self._halt_ts <= 0 or not self._halt_kind):
             await self._clear_halt("halt predates bot-scoped equity curve")
+        # Operator retuned bot_allocation_quote (deposit / withdrawal). Adopt it
+        # when flat so Redis doesn't keep the old probe-sized base forever.
+        declared = self.cycle.bot_allocation
+        if declared > 0 and not self.cycle.trade:
+            old = self._bot_base
+            if old <= 0 or abs(declared - old) / max(old, 1e-9) > 0.02:
+                self._bot_base = declared
+                self._bot_realized = 0.0
+                equity = self._bot_equity()
+                self._peak_equity = max(self._peak_equity, equity)
+                self._day_start_equity = equity
+                self._day_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                self._drawdown_pct = 0.0
+                await self._persist_risk_state()
+                await self._log(
+                    f"[RISK] allocation retuned {old:.4f} → {declared:.4f} "
+                    f"{self._quote_ccy} (operator config)"
+                )
 
     async def _persist_risk_state(self):
         await self.store.save_risk_state(
