@@ -917,14 +917,16 @@ class GreeksEngine:
         self.client = env_delta_client(CFG)
         plan = await self.store.load_trade_plan()
         self.cycle.restore(plan)
-        await self._refresh_capital(force=True)
-        await self._load_halt_state()
         auth = False
         if self.client.api_key:
             auth = await self.client.ping_auth()
+        await self._load_halt_state()
         if auth:
             # Learn the operator's manual inventory before the first entry.
             await self._scan_foreign_positions()
+        # Authenticate first: the wallet is only readable once auth is established,
+        # and an unauthenticated boot silently falls back to the stale ledger.
+        await self._refresh_capital(force=True)
         await self._log("=" * 60)
         await self._log(" RUBAIH GREEKS — Delta options cycle (capital survival)")
         await self._log(f" LIVE_TRADING: {'ON' if self._live else 'OFF (dry-run)'}")
