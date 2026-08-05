@@ -120,16 +120,16 @@ class OptionsCycle:
         self.margin_use_max_frac = float(t.get("margin_use_max_frac", 0.25))
         self.max_premium_budget = float(t.get("max_premium_budget_usdt", 2.0))
         self.min_interval = float(t.get("min_entry_interval_sec", 120))
-        self.entry_cooldown = float(s.get("entry_cooldown_sec", 300))
+        self.entry_cooldown = float(s.get("entry_cooldown_sec", 180))
         self.lookback = int(s.get("momentum_lookback", 20))
-        self.entry_move_pct = float(s.get("entry_move_pct", 0.003))
-        self.min_dte = float(s.get("min_dte_days", 2))
-        self.max_dte = float(s.get("max_dte_days", 5))
-        self.atm_band = float(s.get("atm_band_pct", 0.015))
-        self.max_spread = float(s.get("max_spread_pct", 0.05))
-        self.min_mark = float(s.get("min_mark_premium", 0.5))
-        self.min_delta = float(s.get("min_delta", 0.30))
-        self.max_delta = float(s.get("max_delta", 0.55))
+        self.entry_move_pct = float(s.get("entry_move_pct", 0.0015))
+        self.min_dte = float(s.get("min_dte_days", 1))
+        self.max_dte = float(s.get("max_dte_days", 7))
+        self.atm_band = float(s.get("atm_band_pct", 0.02))
+        self.max_spread = float(s.get("max_spread_pct", 0.08))
+        self.min_mark = float(s.get("min_mark_premium", 0.15))
+        self.min_delta = float(s.get("min_delta", 0.25))
+        self.max_delta = float(s.get("max_delta", 0.60))
         self.target_delta = float(s.get("target_delta", 0.40))
         self.tp_pct = float(s.get("take_profit_premium_pct", 0.35))
         self.sl_pct = float(s.get("stop_loss_premium_pct", 0.18))
@@ -145,6 +145,7 @@ class OptionsCycle:
         self._spot_hist: Dict[str, List[float]] = {u: [] for u in self.underlyings}
         self._last_signal = 0.0
         self._last_hold_log = 0.0
+        self._last_reject: Dict[str, int] = {}
         self.trade: Optional[OpenTrade] = None
 
     def set_free_capital(self, free: float):
@@ -185,11 +186,14 @@ class OptionsCycle:
     @staticmethod
     def _expiry_ts_from_symbol(symbol: str) -> Optional[float]:
         # Delta symbols end with DDMMYY e.g. C-BTC-65000-010826
+        # Expiry is 12:00 UTC (not midnight) — midnight DTE empties the 2–5d window.
         m = re.search(r"-(\d{6})$", symbol or "")
         if not m:
             return None
         try:
-            dt = datetime.strptime(m.group(1), "%d%m%y").replace(tzinfo=timezone.utc)
+            dt = datetime.strptime(m.group(1), "%d%m%y").replace(
+                tzinfo=timezone.utc, hour=12, minute=0, second=0, microsecond=0
+            )
             return dt.timestamp()
         except ValueError:
             return None
@@ -288,27 +292,44 @@ class OptionsCycle:
 
     def filter_rank(self, cands: List[OptionCandidate]) -> List[OptionCandidate]:
         ranked: List[OptionCandidate] = []
+        self._last_reject = {
+            "dte": 0,
+            "spread": 0,
+            "atm": 0,
+            "delta": 0,
+            "mom": 0,
+            "side": 0,
+            "pass": 0,
+        }
         for c in cands:
             if c.dte_days < self.min_dte or c.dte_days > self.max_dte:
+                self._last_reject["dte"] += 1
                 continue
             if c.spread_pct > self.max_spread:
+                self._last_reject["spread"] += 1
                 continue
             if c.spot <= 0:
+                self._last_reject["atm"] += 1
                 continue
             moneyness = abs(c.strike - c.spot) / c.spot
             if moneyness > self.atm_band * 2.5:
+                self._last_reject["atm"] += 1
                 continue
             # Signed delta → abs band for puts/calls
             abs_delta = abs(c.delta) if c.delta != 0 else 0.0
             if abs_delta > 0 and (abs_delta < self.min_delta or abs_delta > self.max_delta):
+                self._last_reject["delta"] += 1
                 continue
             # If exchange omits delta, still allow near-ATM (moneyness already gated)
             mom = self.momentum(c.underlying)
+            if abs(mom) < self.entry_move_pct:
+                self._last_reject["mom"] += 1
+                continue
             if mom >= self.entry_move_pct and c.option_type != "call":
+                self._last_reject["side"] += 1
                 continue
             if mom <= -self.entry_move_pct and c.option_type != "put":
-                continue
-            if abs(mom) < self.entry_move_pct:
+                self._last_reject["side"] += 1
                 continue
             # Prefer mid-delta ~target, tight spread, DTE ~3d, closer ATM
             atm_score = 1.0 / (1e-6 + moneyness)
@@ -326,6 +347,7 @@ class OptionsCycle:
                 + abs(mom) * 40
             )
             ranked.append(c)
+            self._last_reject["pass"] += 1
         ranked.sort(key=lambda x: x.score, reverse=True)
         return ranked
 
@@ -342,8 +364,6 @@ class OptionsCycle:
         now = time.time()
         if self.trade:
             return None
-        if now - self._last_signal < max(self.min_interval, self.entry_cooldown):
-            return None
         cands = []
         spots = {}
         for row in tickers:
@@ -355,28 +375,35 @@ class OptionsCycle:
         for u, spot in spots.items():
             self.note_spot(u, spot)
         ranked = self.filter_rank(cands)
+        if now - self._last_signal < max(self.min_interval, self.entry_cooldown):
+            return None
         if not ranked:
             return None
-        best = ranked[0]
-        # Pay ask when possible (buy); cost uses contract_value
-        px = best.ask if best.ask > 0 else best.mark
-        unit_cost = px * best.contract_value
+        # Prefer contracts that fit budget (cheap ATM lots often unit≪1 USDT)
+        budget = self.budget()
+        fit = []
+        for c in ranked:
+            px = c.ask if c.ask > 0 else c.mark
+            uc = px * c.contract_value
+            if uc > 0 and uc <= budget * 1.01:
+                fit.append((c, px, uc))
+        if not fit:
+            best = ranked[0]
+            px = best.ask if best.ask > 0 else best.mark
+            unit_cost = px * best.contract_value
+            print(
+                f"[SCAN] skip size: best={best.symbol} unit_cost≈{unit_cost:.4f} "
+                f"budget={budget:.4f} ranked={len(ranked)}"
+            )
+            return None
+        best, px, unit_cost = fit[0]
         size = self.size_contracts(unit_cost)
         if size < 1:
-            # Prefer next cheaper ranked names that fit ₹1K budgets
-            for alt in ranked[1:8]:
-                apx = alt.ask if alt.ask > 0 else alt.mark
-                uc = apx * alt.contract_value
-                sz = self.size_contracts(uc)
-                if sz >= 1:
-                    best, px, unit_cost, size = alt, apx, uc, sz
-                    break
-            else:
-                print(
-                    f"[SCAN] skip size: best={best.symbol} unit_cost≈{unit_cost:.2f} "
-                    f"budget=₹{self.budget():.0f}"
-                )
-                return None
+            print(
+                f"[SCAN] skip size: best={best.symbol} unit_cost≈{unit_cost:.4f} "
+                f"budget={budget:.4f}"
+            )
+            return None
         self._last_signal = now
         mom = self.momentum(best.underlying)
         return Signal(
@@ -392,8 +419,8 @@ class OptionsCycle:
             reason=(
                 f"ENTRY_{best.option_type.upper()}: {best.symbol} mom={mom:+.2%} "
                 f"spot={best.spot:.2f} K={best.strike:.2f} dte={best.dte_days:.1f}d "
-                f"delta={best.delta:+.2f} mark={px:.4f} unit≈{unit_cost:.2f} size={size} "
-                f"budget={self.budget():.2f} TP=+{self.tp_pct:.0%} SL=-{self.sl_pct:.0%}"
+                f"delta={best.delta:+.2f} mark={px:.4f} unit≈{unit_cost:.4f} size={size} "
+                f"budget={budget:.4f} TP=+{self.tp_pct:.0%} SL=-{self.sl_pct:.0%}"
             ),
         )
 
@@ -1213,9 +1240,18 @@ class GreeksEngine:
                     if entry:
                         await self._execute(entry)
                     elif int(time.time()) % 60 < 3:
+                        rej = getattr(self.cycle, "_last_reject", {}) or {}
+                        mom_btc = self.cycle.momentum("BTC")
+                        mom_eth = self.cycle.momentum("ETH")
                         await self._log(
-                            f"[SCAN] candidates from {len(tickers or [])} tickers | "
-                            f"free={self.cycle.free_capital_inr:.4f} budget={self.cycle.budget():.4f}"
+                            f"[SCAN] tickers={len(tickers or [])} "
+                            f"free={self.cycle.free_capital_inr:.4f} "
+                            f"budget={self.cycle.budget():.4f} "
+                            f"pass={rej.get('pass', 0)} "
+                            f"rej dte={rej.get('dte', 0)} spr={rej.get('spread', 0)} "
+                            f"atm={rej.get('atm', 0)} δ={rej.get('delta', 0)} "
+                            f"mom={rej.get('mom', 0)} side={rej.get('side', 0)} "
+                            f"| mom BTC={mom_btc:+.3%} ETH={mom_eth:+.3%}"
                         )
                 await self._publish()
             except Exception as e:

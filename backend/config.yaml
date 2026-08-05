@@ -10,7 +10,7 @@ trading:
   capital_inr: 1000
   # Convert INR seed → USDT quote when Delta wallet is USD/USDT
   usdt_inr: 87
-  # Capital survival: small premium per trade (was 55–60%)
+  # Capital survival: small premium per trade
   margin_use_frac: 0.20
   margin_use_max_frac: 0.25
   # Hard cap so one trade cannot empty a tiny USDT book
@@ -20,31 +20,28 @@ trading:
     - ETH
   # Buy calls/puts only — never sell premium in v1
   allow_sell_premium: false
-  min_entry_interval_sec: 120
+  min_entry_interval_sec: 90
   strategy:
-    entry_cooldown_sec: 300
+    entry_cooldown_sec: 180
     momentum_lookback: 20
-    entry_move_pct: 0.003
-    # Skip 0–1D lottery and slow far theta
-    min_dte_days: 2
-    max_dte_days: 5
-    # Near-ATM only
-    atm_band_pct: 0.015
-    # Tighter liquidity
-    max_spread_pct: 0.05
-    min_mark_premium: 0.5
-    # Directional delta band (abs for puts)
-    min_delta: 0.30
-    max_delta: 0.55
+    # Was 0.3% — too quiet for small-book probe
+    entry_move_pct: 0.0015
+    # DTE uses 12:00 UTC expiry. Allow 1–7d so weeklies are reachable.
+    min_dte_days: 1
+    max_dte_days: 7
+    atm_band_pct: 0.02
+    max_spread_pct: 0.08
+    # unit_cost = mark * contract_value; ATM lots are often ~0.2–0.5 USDT
+    min_mark_premium: 0.15
+    min_delta: 0.25
+    max_delta: 0.60
     target_delta: 0.40
-    # Premium % exits (option price, not underlying)
     take_profit_premium_pct: 0.35
     stop_loss_premium_pct: 0.18
     max_loss_frac: 0.10
     trail_arm_r: 0.7
     trail_giveback_r: 0.4
     trail_giveback_of_peak: 0.25
-    # Enforce 4h time stop (was 0 / ignored)
     max_hold_sec: 14400
 
 risk:
