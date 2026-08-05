@@ -342,6 +342,11 @@ export default function App() {
                 <Text style={styles.help}>
                   {String(dashboard?.halt_reason || 'Drawdown / daily loss limit hit. No new entries until you resume.')}
                 </Text>
+                {Number(dashboard?.halt_resume_in_sec) > 0 && (
+                  <Text style={styles.help}>
+                    {`Auto-resume in ${Math.ceil(Number(dashboard.halt_resume_in_sec) / 60)} min — or resume now:`}
+                  </Text>
+                )}
                 <TouchableOpacity style={styles.primaryBtn} onPress={resumeHalt} activeOpacity={0.8}>
                   <Text style={styles.primaryText} numberOfLines={1}>Resume trading</Text>
                 </TouchableOpacity>

@@ -174,6 +174,8 @@ async def settings():
         "max_delta": str(s.get("max_delta", 0.55)),
         "max_drawdown_pct": str(risk.get("max_drawdown_pct", 0.15)),
         "max_daily_loss_frac": str(risk.get("max_daily_loss_frac", 0.25)),
+        "auto_resume": str(bool(risk.get("auto_resume", True))).lower(),
+        "halt_cooldown_min": str(risk.get("halt_cooldown_min", 60)),
         "allow_sell_premium": str(bool(t.get("allow_sell_premium", False))).lower(),
         "ai_emergency_conf": "0.95",
         "ai_note": "ENTER/EXIT advisory only; EMERGENCY acts only if confidence > 0.95",

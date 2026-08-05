@@ -141,6 +141,9 @@ class OptionsCycle:
         self.max_drawdown_pct = float(r.get("max_drawdown_pct", 0.15))
         self.max_daily_loss_frac = float(r.get("max_daily_loss_frac", 0.25))
         self.kill_on_drawdown = bool(r.get("kill_switch_on_drawdown", True))
+        self.halt_confirm_readings = max(1, int(r.get("halt_confirm_readings", 2)))
+        self.auto_resume = bool(r.get("auto_resume", True))
+        self.halt_cooldown_sec = max(0.0, float(r.get("halt_cooldown_min", 60)) * 60.0)
         self.taker_fee = float((cfg.get("exchange") or {}).get("taker_fee", 0.0005))
         self._spot_hist: Dict[str, List[float]] = {u: [] for u in self.underlyings}
         self._last_signal = 0.0
@@ -805,6 +808,9 @@ class GreeksEngine:
         self._day_start_free = 0.0
         self._day_key = ""
         self._drawdown_pct = 0.0
+        self._halt_ts = 0.0
+        self._breach_count = 0
+        self._equity = 0.0
 
     async def _log(self, line: str):
         print(line)
@@ -842,8 +848,10 @@ class GreeksEngine:
             f"trail={self.cycle.trail_arm_r}R max_hold={self.cycle.max_hold_sec:.0f}s"
         )
         await self._log(
-            f" Risk: max_dd={self.cycle.max_drawdown_pct:.0%} "
+            f" Risk: max_dd={self.cycle.max_drawdown_pct:.0%} (on equity) "
             f"daily_loss={self.cycle.max_daily_loss_frac:.0%} "
+            f"confirm={self.cycle.halt_confirm_readings} "
+            f"auto_resume={'ON ' + f'{self.cycle.halt_cooldown_sec / 60:.0f}m' if self.cycle.auto_resume else 'OFF'} "
             f"halted={self._halted}"
         )
         await self._log(" AI conf: advisory only; EMERGENCY acts only if conf>0.95")
@@ -948,6 +956,9 @@ class GreeksEngine:
         self._day_start_free = _f(state.get("day_start_free"))
         self._day_key = str(state.get("day_key") or "")
         self._drawdown_pct = _f(state.get("drawdown_pct"))
+        self._halt_ts = _f(state.get("halt_ts"))
+        if self._halted and self._halt_ts <= 0:
+            self._halt_ts = time.time()
 
     async def _persist_risk_state(self):
         await self.store.save_risk_state(
@@ -956,32 +967,49 @@ class GreeksEngine:
                 "day_start_free": self._day_start_free,
                 "day_key": self._day_key,
                 "drawdown_pct": self._drawdown_pct,
+                "halt_ts": self._halt_ts,
                 "ts": time.time(),
             }
         )
 
+    def _position_value(self) -> float:
+        """Market value of the open option (quote ccy) so equity isn't dented by entries."""
+        t = self.cycle.trade
+        if not t or t.size <= 0:
+            return 0.0
+        mark = self._mark_cache.get(t.symbol, 0.0) or t.entry_premium
+        return max(0.0, mark * t.size * float(t.contract_value or 1.0))
+
     async def _update_risk_after_capital(self, free: float):
-        """Track peak/daily equity; halt on drawdown or daily loss (survives restart)."""
+        """Halt on equity drawdown / daily loss.
+
+        Equity = free cash + open premium value. Cash alone drops by the whole
+        premium the moment a trade opens, which used to look like a drawdown.
+        """
         if free <= 0:
             return
+        equity = free + self._position_value()
+        self._equity = equity
         day_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if day_key != self._day_key or self._day_start_free <= 0:
             self._day_key = day_key
-            self._day_start_free = free
-            if self._peak_free <= 0:
-                self._peak_free = free
+            self._day_start_free = equity
+            # Fresh high-water mark each UTC day so an old peak can't halt forever
+            self._peak_free = equity
+            self._breach_count = 0
             await self._persist_risk_state()
             await self._log(
-                f"[RISK] day start free={free:.4f} {self._quote_ccy} peak={self._peak_free:.4f}"
+                f"[RISK] day start equity={equity:.4f} {self._quote_ccy} "
+                f"(cash={free:.4f}) peak reset"
             )
 
-        if free > self._peak_free:
-            self._peak_free = free
+        if equity > self._peak_free:
+            self._peak_free = equity
         self._drawdown_pct = (
-            (self._peak_free - free) / self._peak_free if self._peak_free > 0 else 0.0
+            (self._peak_free - equity) / self._peak_free if self._peak_free > 0 else 0.0
         )
         daily_loss_frac = (
-            (self._day_start_free - free) / self._day_start_free
+            (self._day_start_free - equity) / self._day_start_free
             if self._day_start_free > 0
             else 0.0
         )
@@ -996,24 +1024,42 @@ class GreeksEngine:
         if self._drawdown_pct >= self.cycle.max_drawdown_pct:
             reason = (
                 f"drawdown {self._drawdown_pct:.1%} >= "
-                f"{self.cycle.max_drawdown_pct:.1%} (peak={self._peak_free:.4f})"
+                f"{self.cycle.max_drawdown_pct:.1%} "
+                f"(equity={equity:.4f} peak={self._peak_free:.4f})"
             )
         elif daily_loss_frac >= self.cycle.max_daily_loss_frac:
             reason = (
                 f"daily loss {daily_loss_frac:.1%} >= "
                 f"{self.cycle.max_daily_loss_frac:.1%} "
-                f"(day_start={self._day_start_free:.4f})"
+                f"(equity={equity:.4f} day_start={self._day_start_free:.4f})"
             )
-        if reason:
-            await self._trigger_halt(reason)
+        if not reason:
+            self._breach_count = 0
+            return
+        # Wallet/mark blips must not halt on a single reading
+        self._breach_count += 1
+        if self._breach_count < self.cycle.halt_confirm_readings:
+            await self._log(
+                f"[RISK] breach {self._breach_count}/{self.cycle.halt_confirm_readings}: {reason}"
+            )
+            return
+        await self._trigger_halt(reason)
 
     async def _trigger_halt(self, reason: str):
         if self._halted:
             return
         self._halted = True
         self._halt_reason = reason
+        self._halt_ts = time.time()
+        self._breach_count = 0
         await self.store.set_halted(True, reason)
-        await self._log(f"[HALT] {reason} — flatten open trade; block new entries until resume")
+        await self._persist_risk_state()
+        cooldown = (
+            f"auto-resume in {self.cycle.halt_cooldown_sec / 60:.0f}m"
+            if self.cycle.auto_resume
+            else "manual resume required"
+        )
+        await self._log(f"[HALT] {reason} — flatten open trade; block entries ({cooldown})")
         t = self.cycle.trade
         if t:
             mark = self._mark_cache.get(t.symbol, t.entry_premium)
@@ -1032,20 +1078,38 @@ class GreeksEngine:
             await self._execute(sig)
         await self.store.set_status("halted", reason)
 
-    async def _clear_halt(self):
+    async def _clear_halt(self, note: str = "operator resume"):
         self._halted = False
         self._halt_reason = ""
+        self._halt_ts = 0.0
+        self._breach_count = 0
         await self.store.set_halted(False)
-        # Reset peak/day baseline to current free so we don't immediately re-halt
-        free = float(self.cycle.free_capital_inr or 0)
-        if free > 0:
-            self._peak_free = free
-            self._day_start_free = free
+        # Re-baseline to current equity so we don't immediately re-halt
+        equity = float(self.cycle.free_capital_inr or 0) + self._position_value()
+        if equity > 0:
+            self._peak_free = equity
+            self._day_start_free = equity
             self._day_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             self._drawdown_pct = 0.0
-            await self._persist_risk_state()
+        await self._persist_risk_state()
         await self.store.set_status("running")
-        await self._log("[HALT] Cleared — entries allowed again (risk baseline reset)")
+        await self._log(
+            f"[HALT] Cleared ({note}) — entries allowed again, baseline={equity:.4f}"
+        )
+
+    async def _maybe_auto_resume(self) -> bool:
+        """Clear a risk halt after cooldown so no manual VPS resume is needed."""
+        if not self._halted or not self.cycle.auto_resume:
+            return False
+        if self._halt_ts <= 0:
+            self._halt_ts = time.time()
+            await self._persist_risk_state()
+            return False
+        waited = time.time() - self._halt_ts
+        if waited < self.cycle.halt_cooldown_sec:
+            return False
+        await self._clear_halt(f"auto-resume after {waited / 60:.0f}m cooldown")
+        return True
 
     async def _publish(self):
         t = self.cycle.trade
@@ -1072,6 +1136,13 @@ class GreeksEngine:
             "drawdown_pct": self._drawdown_pct,
             "peak_free": self._peak_free,
             "day_start_free": self._day_start_free,
+            "equity_quote": free + self._position_value(),
+            "auto_resume": self.cycle.auto_resume,
+            "halt_resume_in_sec": max(
+                0.0, self.cycle.halt_cooldown_sec - (time.time() - self._halt_ts)
+            )
+            if (self._halted and self.cycle.auto_resume and self._halt_ts > 0)
+            else 0.0,
             "ai_enabled": self._ai_enabled,
             "ai_last_action": (self._ai_last or {}).get("action"),
             "ai_confidence": (self._ai_last or {}).get("confidence"),
@@ -1229,11 +1300,19 @@ class GreeksEngine:
                                 await self._execute(exit_sig)
                     except Exception as e:
                         await self._log(f"[MARK] {sym}: {e}")
-                elif self._halted:
+                elif self._halted and not await self._maybe_auto_resume():
                     if int(time.time()) % 90 < 3:
+                        left = max(
+                            0.0,
+                            self.cycle.halt_cooldown_sec - (time.time() - self._halt_ts),
+                        )
+                        when = (
+                            f"auto-resume in {left / 60:.0f}m"
+                            if self.cycle.auto_resume
+                            else "POST /api/resume to clear"
+                        )
                         await self._log(
-                            f"[HALT] blocked entries — {self._halt_reason or 'risk'} "
-                            f"(POST /api/resume to clear)"
+                            f"[HALT] blocked entries — {self._halt_reason or 'risk'} ({when})"
                         )
                 else:
                     entry = self.cycle.pick_entry(tickers or [])
