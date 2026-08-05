@@ -20,7 +20,7 @@ import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import asyncpg
 import redis.asyncio as aioredis
@@ -75,6 +75,8 @@ class OptionCandidate:
     unit_cost: float = 0.0  # approx quote currency cost for 1 contract
     delta: float = 0.0  # raw signed delta from exchange
     score: float = 0.0
+    friction_pct: float = 0.0  # round-trip spread + fees, as a share of premium
+    edge_pct: float = 0.0  # delta-implied premium move from current momentum
 
 
 @dataclass
@@ -141,9 +143,10 @@ class OptionsCycle:
         self.min_delta = float(s.get("min_delta", 0.25))
         self.max_delta = float(s.get("max_delta", 0.60))
         self.target_delta = float(s.get("target_delta", 0.40))
-        self.tp_pct = float(s.get("take_profit_premium_pct", 0.35))
-        self.sl_pct = float(s.get("stop_loss_premium_pct", 0.18))
-        self.max_loss_frac = float(s.get("max_loss_frac", 0.10))
+        self.tp_pct = float(s.get("take_profit_premium_pct", 0.50))
+        self.sl_pct = float(s.get("stop_loss_premium_pct", 0.25))
+        self.max_loss_frac = float(s.get("max_loss_frac", 0.30))
+        self.min_edge_multiple = max(0.0, float(s.get("min_edge_multiple", 1.5)))
         self.trail_arm_r = float(s.get("trail_arm_r", 0.7))
         self.trail_giveback_r = float(s.get("trail_giveback_r", 0.4))
         self.trail_giveback_of_peak = float(s.get("trail_giveback_of_peak", 0.25))
@@ -154,12 +157,46 @@ class OptionsCycle:
         self.halt_confirm_readings = max(1, int(r.get("halt_confirm_readings", 2)))
         self.auto_resume = bool(r.get("auto_resume", True))
         self.halt_cooldown_sec = max(0.0, float(r.get("halt_cooldown_min", 60)) * 60.0)
-        self.taker_fee = float((cfg.get("exchange") or {}).get("taker_fee", 0.0005))
+        self.bot_allocation = float(r.get("bot_allocation_quote", 0) or 0)
+        self.min_free_quote = max(0.0, float(r.get("min_free_quote", 1.0)))
+        self.max_total_loss_frac = max(0.0, float(r.get("max_total_loss_frac", 0.35)))
+        self.halt_recover_frac = min(1.0, max(0.0, float(r.get("halt_recover_frac", 0.7))))
+        self.taker_fee = float((cfg.get("exchange") or {}).get("taker_fee", 0.014))
+        # Recalibrated from real fills; the config value is only a seed.
+        self.fee_rate = self.taker_fee
+        self._fee_obs = 0
+        # Product ids the operator holds manually. The bot must not size, exit,
+        # or reconcile against positions it did not open.
+        self.excluded_pids: Set[int] = set()
         self._spot_hist: Dict[str, List[float]] = {u: [] for u in self.underlyings}
         self._last_signal = 0.0
         self._last_hold_log = 0.0
         self._last_reject: Dict[str, int] = {}
         self.trade: Optional[OpenTrade] = None
+
+    def note_fee_observation(self, fee: float, premium_notional: float):
+        """Learn the true taker rate from settled fills.
+
+        Delta charges options fees against underlying notional, so a rate
+        expressed as a share of premium is only knowable after the fact.
+        """
+        if fee <= 0 or premium_notional <= 0:
+            return
+        rate = fee / premium_notional
+        if not 0.0 < rate < 0.5:
+            return
+        self._fee_obs += 1
+        # Converge fast off the config seed, then smooth.
+        alpha = 0.5 if self._fee_obs <= 3 else 0.25
+        self.fee_rate = (1.0 - alpha) * self.fee_rate + alpha * rate
+
+    def round_trip_friction(self, spread_pct: float) -> float:
+        """Cost of a full round trip as a share of premium.
+
+        The spread is crossed on the way in and on the way out, and the taker
+        fee is charged on both legs.
+        """
+        return max(0.0, spread_pct) + 2.0 * max(0.0, self.fee_rate)
 
     def set_free_capital(self, free: float):
         value = max(0.0, float(free or 0.0))
@@ -314,9 +351,14 @@ class OptionsCycle:
             "delta": 0,
             "mom": 0,
             "side": 0,
+            "held": 0,
+            "edge": 0,
             "pass": 0,
         }
         for c in cands:
+            if c.product_id in self.excluded_pids:
+                self._last_reject["held"] += 1
+                continue
             if c.dte_days < self.min_dte or c.dte_days > self.max_dte:
                 self._last_reject["dte"] += 1
                 continue
@@ -346,6 +388,16 @@ class OptionsCycle:
             if mom <= -self.entry_move_pct and c.option_type != "put":
                 self._last_reject["side"] += 1
                 continue
+            # Expectancy gate. Premium responds to spot by delta, so the move
+            # already in hand is worth delta * spot_move, expressed as a share
+            # of the premium being paid. Unless that clears the round trip's
+            # spread and fees by a margin, the trade is a losing coin flip.
+            c.friction_pct = self.round_trip_friction(c.spread_pct)
+            eff_delta = abs(c.delta) if c.delta != 0 else self.target_delta
+            c.edge_pct = eff_delta * abs(mom) * c.spot / max(c.mark, 1e-9)
+            if c.edge_pct < c.friction_pct * self.min_edge_multiple:
+                self._last_reject["edge"] += 1
+                continue
             # Prefer mid-delta ~target, tight spread, DTE ~3d, closer ATM
             atm_score = 1.0 / (1e-6 + moneyness)
             spread_score = 1.0 / (1e-6 + c.spread_pct)
@@ -360,6 +412,7 @@ class OptionsCycle:
                 + max(0.0, dte_score)
                 + delta_score * 1.5
                 + abs(mom) * 40
+                + (c.edge_pct / max(c.friction_pct, 1e-9)) * 3
             )
             ranked.append(c)
             self._last_reject["pass"] += 1
@@ -465,8 +518,8 @@ class OptionsCycle:
         )
         print(
             f"[PLAN] {sig.symbol} entry={entry:.4f} size={sig.size} cval={cval} "
-            f"cost~₹{cost:.0f} | TP=+{self.tp_pct:.0%}→{tp:.4f} "
-            f"SL=-{self.sl_pct:.0%}→{sl:.4f} | 1R=₹{r:.0f} trail={self.trail_arm_r}R"
+            f"cost={cost:.4f} | TP=+{self.tp_pct:.0%}→{tp:.4f} "
+            f"SL=-{self.sl_pct:.0%}→{sl:.4f} | 1R={r:.4f} trail={self.trail_arm_r}R"
         )
 
     def clear(self):
@@ -525,7 +578,7 @@ class OptionsCycle:
         t.peak_premium = max(t.peak_premium, mark)
         giveback = t.peak_pnl - pnl
         arm = t.r_inr * self.trail_arm_r
-        fees = t.entry_premium * t.size * cval * self.taker_fee * 2
+        fees = t.entry_premium * t.size * cval * self.fee_rate * 2
         giveback_need = max(
             t.r_inr * self.trail_giveback_r,
             t.peak_pnl * self.trail_giveback_of_peak if t.peak_pnl > 0 else 0.0,
@@ -817,8 +870,6 @@ class GreeksEngine:
         self._delta_cache: Dict[str, float] = {}
         self._halted = False
         self._halt_reason = ""
-        self._peak_free = 0.0
-        self._day_start_free = 0.0
         self._day_key = ""
         self._drawdown_pct = 0.0
         self._halt_ts = 0.0
@@ -838,6 +889,17 @@ class GreeksEngine:
             2, int(risk_cfg.get("flat_confirm_readings", 2))
         )
         self._entry_blocked = False
+        # Risk is measured on the bot's own curve: allocation + its realised PnL
+        # + its open position. Wallet balance is collateral availability only.
+        self._bot_base = 0.0
+        self._bot_realized = 0.0
+        self._peak_equity = 0.0
+        self._day_start_equity = 0.0
+        self._halt_kind = ""
+        # Non-halt entry block (e.g. wallet below the floor) — not a loss.
+        self._risk_block = ""
+        # Product ids Delta reports that this bot did not open.
+        self._foreign_pids: Set[int] = set()
 
     async def _log(self, line: str):
         print(line)
@@ -860,6 +922,9 @@ class GreeksEngine:
         auth = False
         if self.client.api_key:
             auth = await self.client.ping_auth()
+        if auth:
+            # Learn the operator's manual inventory before the first entry.
+            await self._scan_foreign_positions()
         await self._log("=" * 60)
         await self._log(" RUBAIH GREEKS — Delta options cycle (capital survival)")
         await self._log(f" LIVE_TRADING: {'ON' if self._live else 'OFF (dry-run)'}")
@@ -879,11 +944,20 @@ class GreeksEngine:
             f"trail={self.cycle.trail_arm_r}R max_hold={self.cycle.max_hold_sec:.0f}s"
         )
         await self._log(
-            f" Risk: max_dd={self.cycle.max_drawdown_pct:.0%} (on equity) "
+            f" Risk: max_dd={self.cycle.max_drawdown_pct:.0%} of bot equity "
             f"daily_loss={self.cycle.max_daily_loss_frac:.0%} "
-            f"confirm={self.cycle.halt_confirm_readings} "
-            f"auto_resume={'ON ' + f'{self.cycle.halt_cooldown_sec / 60:.0f}m' if self.cycle.auto_resume else 'OFF'} "
-            f"halted={self._halted}"
+            f"ruin_stop={self.cycle.max_total_loss_frac:.0%} "
+            f"floor={self.cycle.min_free_quote:.2f} {self._quote_ccy} "
+            f"confirm={self.cycle.halt_confirm_readings} halted={self._halted}"
+        )
+        await self._log(
+            f" Edge gate: need {self.cycle.min_edge_multiple:.1f}x round-trip "
+            f"friction (spread<={self.cycle.max_spread:.1%} + "
+            f"fee {self.cycle.fee_rate:.2%}/side)"
+        )
+        await self._log(
+            f" Manual positions protected: "
+            f"{sorted(self._foreign_pids) if self._foreign_pids else 'none detected'}"
         )
         await self._log(" AI conf: advisory only; EMERGENCY acts only if conf>0.95")
         await self._log("=" * 60)
@@ -1020,27 +1094,31 @@ class GreeksEngine:
         self._halted = await self.store.is_halted()
         self._halt_reason = await self.store.get_halt_reason() if self._halted else ""
         state = await self.store.load_risk_state()
-        self._peak_free = _f(state.get("peak_free"))
-        self._day_start_free = _f(state.get("day_start_free"))
+        self._bot_base = _f(state.get("bot_base"))
+        self._bot_realized = _f(state.get("bot_realized"))
+        self._peak_equity = _f(state.get("peak_equity"))
+        self._day_start_equity = _f(state.get("day_start_equity"))
         self._day_key = str(state.get("day_key") or "")
         self._drawdown_pct = _f(state.get("drawdown_pct"))
         self._halt_ts = _f(state.get("halt_ts"))
-        # A halt with no timestamp predates auto-resume and was computed on cash,
-        # not equity — drop it instead of serving a cooldown for a phantom loss.
-        if self._halted and self._halt_ts <= 0:
-            if self.cycle.auto_resume:
-                await self._clear_halt("stale halt from previous build")
-            else:
-                self._halt_ts = time.time()
+        self._halt_kind = str(state.get("halt_kind") or "")
+        # Halts persisted before the bot had its own equity curve were computed
+        # from wallet balance, which every manual trade moved. Drop them rather
+        # than serve a cooldown for a loss the bot never took.
+        if self._halted and (self._halt_ts <= 0 or not self._halt_kind):
+            await self._clear_halt("halt predates bot-scoped equity curve")
 
     async def _persist_risk_state(self):
         await self.store.save_risk_state(
             {
-                "peak_free": self._peak_free,
-                "day_start_free": self._day_start_free,
+                "bot_base": self._bot_base,
+                "bot_realized": self._bot_realized,
+                "peak_equity": self._peak_equity,
+                "day_start_equity": self._day_start_equity,
                 "day_key": self._day_key,
                 "drawdown_pct": self._drawdown_pct,
                 "halt_ts": self._halt_ts,
+                "halt_kind": self._halt_kind,
                 "ts": time.time(),
             }
         )
@@ -1053,37 +1131,80 @@ class GreeksEngine:
         mark = self._mark_cache.get(t.symbol, 0.0) or t.entry_premium
         return max(0.0, mark * t.size * float(t.contract_value or 1.0))
 
-    async def _update_risk_after_capital(self, free: float):
-        """Halt on equity drawdown / daily loss.
+    def _bot_equity(self) -> float:
+        """The bot's own equity curve, independent of the wallet.
 
-        Equity = free cash + open premium value. Cash alone drops by the whole
-        premium the moment a trade opens, which used to look like a drawdown.
+        Wallet balance moves whenever the operator opens a manual position or
+        transfers funds. Measuring risk on it makes the operator's own trading
+        look like bot losses, so performance is tracked from the allocation the
+        bot was given plus only the PnL the bot itself produced.
+        """
+        return self._bot_base + self._bot_realized + self._unrealized()
+
+    def _unrealized(self) -> float:
+        t = self.cycle.trade
+        if not t or t.size <= 0:
+            return 0.0
+        mark = self._mark_cache.get(t.symbol, 0.0) or t.entry_premium
+        return (mark - t.entry_premium) * t.size * float(t.contract_value or 1.0)
+
+    def _seed_bot_base(self, free: float) -> float:
+        declared = self.cycle.bot_allocation
+        if declared <= 0:
+            declared = self.cycle.capital_inr / max(self.cycle.usdt_inr, 1.0)
+        return declared if declared > 0 else max(free, 0.0)
+
+    async def _update_risk_after_capital(self, free: float):
+        """Halt on the bot's own drawdown; block entries on collateral floors.
+
+        These are two different questions. "Has the bot lost money?" is answered
+        by its equity curve. "Can it afford a trade right now?" is answered by
+        the wallet, which the operator's manual positions legitimately reduce.
         """
         if free < 0:
             return
-        equity = free + self._position_value()
-        self._equity = equity
-        day_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        if day_key != self._day_key or self._day_start_free <= 0:
-            self._day_key = day_key
-            self._day_start_free = equity
-            # Fresh high-water mark each UTC day so an old peak can't halt forever
-            self._peak_free = equity
-            self._breach_count = 0
-            await self._persist_risk_state()
+        if self._bot_base <= 0:
+            self._bot_base = self._seed_bot_base(free)
             await self._log(
-                f"[RISK] day start equity={equity:.4f} {self._quote_ccy} "
-                f"(cash={free:.4f}) peak reset"
+                f"[RISK] bot allocation base={self._bot_base:.4f} {self._quote_ccy}"
             )
 
-        if equity > self._peak_free:
-            self._peak_free = equity
+        equity = self._bot_equity()
+        self._equity = equity
+
+        # Collateral availability is a block, never a loss.
+        if free < self.cycle.min_free_quote:
+            self._risk_block = (
+                f"free {free:.4f} < floor {self.cycle.min_free_quote:.4f} "
+                f"{self._quote_ccy}"
+            )
+        else:
+            self._risk_block = ""
+
+        day_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if day_key != self._day_key or self._day_start_equity <= 0:
+            self._day_key = day_key
+            self._day_start_equity = equity
+            self._breach_count = 0
+            await self._log(f"[RISK] day start equity={equity:.4f} {self._quote_ccy}")
+
+        # High-water mark only ever rises. Nothing but an explicit operator
+        # reset may lower it, or a 15% limit becomes an endless series of them.
+        if equity > self._peak_equity:
+            self._peak_equity = equity
         self._drawdown_pct = (
-            (self._peak_free - equity) / self._peak_free if self._peak_free > 0 else 0.0
+            (self._peak_equity - equity) / self._peak_equity
+            if self._peak_equity > 0
+            else 0.0
         )
         daily_loss_frac = (
-            (self._day_start_free - equity) / self._day_start_free
-            if self._day_start_free > 0
+            (self._day_start_equity - equity) / self._day_start_equity
+            if self._day_start_equity > 0
+            else 0.0
+        )
+        total_loss_frac = (
+            max(0.0, -self._bot_realized) / self._bot_base
+            if self._bot_base > 0
             else 0.0
         )
         await self._persist_risk_state()
@@ -1094,34 +1215,45 @@ class GreeksEngine:
             return
 
         reason = ""
-        if self._drawdown_pct >= self.cycle.max_drawdown_pct:
+        kind = ""
+        if total_loss_frac >= self.cycle.max_total_loss_frac:
+            kind = "ruin"
+            reason = (
+                f"realised loss {total_loss_frac:.1%} >= "
+                f"{self.cycle.max_total_loss_frac:.1%} of allocation "
+                f"(realised={self._bot_realized:.4f} base={self._bot_base:.4f})"
+            )
+        elif self._drawdown_pct >= self.cycle.max_drawdown_pct:
+            kind = "drawdown"
             reason = (
                 f"drawdown {self._drawdown_pct:.1%} >= "
                 f"{self.cycle.max_drawdown_pct:.1%} "
-                f"(equity={equity:.4f} peak={self._peak_free:.4f})"
+                f"(equity={equity:.4f} peak={self._peak_equity:.4f})"
             )
         elif daily_loss_frac >= self.cycle.max_daily_loss_frac:
+            kind = "daily"
             reason = (
                 f"daily loss {daily_loss_frac:.1%} >= "
                 f"{self.cycle.max_daily_loss_frac:.1%} "
-                f"(equity={equity:.4f} day_start={self._day_start_free:.4f})"
+                f"(equity={equity:.4f} day_start={self._day_start_equity:.4f})"
             )
         if not reason:
             self._breach_count = 0
             return
-        # Wallet/mark blips must not halt on a single reading
+        # Mark blips must not halt on a single reading
         self._breach_count += 1
         if self._breach_count < self.cycle.halt_confirm_readings:
             await self._log(
                 f"[RISK] breach {self._breach_count}/{self.cycle.halt_confirm_readings}: {reason}"
             )
             return
-        await self._trigger_halt(reason)
+        await self._trigger_halt(reason, kind)
 
-    async def _trigger_halt(self, reason: str):
+    async def _trigger_halt(self, reason: str, kind: str = "drawdown"):
         if self._halted:
             return
         self._halted = True
+        self._halt_kind = kind
         self._halt_reason = reason
         self._halt_ts = time.time()
         self._breach_count = 0
@@ -1153,31 +1285,48 @@ class GreeksEngine:
                 await self._execute_serialized(sig)
         await self.store.set_status("halted", reason)
 
-    async def _clear_halt(self, note: str = "operator resume"):
+    async def _clear_halt(self, note: str = "operator resume", rebase: bool = True):
+        """Resume trading. Only an operator may move the high-water mark.
+
+        Rebasing on a timer is what turns a 15% drawdown limit into an unbounded
+        sequence of 15% losses, so auto-resume passes rebase=False.
+        """
         async with self._state_lock:
             self._halted = False
             self._halt_reason = ""
+            self._halt_kind = ""
             self._halt_ts = 0.0
             self._breach_count = 0
             self._entry_blocked = False
             await self.store.set_halted(False)
-            # Re-baseline to current equity so we don't immediately re-halt
-            equity = self.cycle.free_capital_quote + self._position_value()
-            if equity >= 0:
-                self._peak_free = equity
-                self._day_start_free = equity
+            if rebase:
+                # A human explicitly accepted the loss: fold realised PnL into a
+                # new base so the ruin guard measures from here on.
+                self._bot_base = max(0.0, self._bot_base + self._bot_realized)
+                self._bot_realized = 0.0
+                equity = self._bot_equity()
+                self._peak_equity = equity
+                self._day_start_equity = equity
                 self._day_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                 self._drawdown_pct = 0.0
+            equity = self._bot_equity()
             await self._persist_risk_state()
         await self.store.set_status("running")
         await self._log(
-            f"[HALT] Cleared ({note}) — entries allowed again, baseline={equity:.4f}"
+            f"[HALT] Cleared ({note}) — entries allowed again, "
+            f"equity={equity:.4f} peak={self._peak_equity:.4f}"
         )
 
     async def _maybe_auto_resume(self) -> bool:
-        """Clear a risk halt after cooldown so no manual VPS resume is needed."""
+        """Resume only once the breached condition has actually cleared.
+
+        A cooldown timer says nothing about whether the risk is gone, so it
+        gates re-entry but never substitutes for recovery.
+        """
         if not self._halted or not self.cycle.auto_resume:
             return False
+        if self._halt_kind == "ruin":
+            return False  # terminal: needs a human and probably a refund
         if self._halt_ts <= 0:
             self._halt_ts = time.time()
             await self._persist_risk_state()
@@ -1185,7 +1334,17 @@ class GreeksEngine:
         waited = time.time() - self._halt_ts
         if waited < self.cycle.halt_cooldown_sec:
             return False
-        await self._clear_halt(f"auto-resume after {waited / 60:.0f}m cooldown")
+        if self._halt_kind == "daily":
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            if self._day_key == today:
+                return False  # a daily limit lasts the rest of the day
+            cleared = "UTC day rolled over"
+        else:
+            recover_at = self.cycle.max_drawdown_pct * self.cycle.halt_recover_frac
+            if self._drawdown_pct > recover_at:
+                return False
+            cleared = f"drawdown {self._drawdown_pct:.1%} <= {recover_at:.1%}"
+        await self._clear_halt(f"auto-resume: {cleared}", rebase=False)
         return True
 
     async def _publish(self):
@@ -1214,14 +1373,28 @@ class GreeksEngine:
             "halted": self._halted,
             "halt_reason": self._halt_reason,
             "drawdown_pct": self._drawdown_pct,
-            "peak_free": self._peak_free,
-            "day_start_free": self._day_start_free,
+            "halt_kind": self._halt_kind,
+            "risk_block": self._risk_block,
+            "bot_base": self._bot_base,
+            "bot_realized": self._bot_realized,
+            "bot_equity": self._bot_equity(),
+            "peak_free": self._peak_equity,  # legacy key, now the bot's peak
+            "peak_equity": self._peak_equity,
+            "day_start_free": self._day_start_equity,
+            "day_start_equity": self._day_start_equity,
             "equity_quote": free + self._position_value(),
+            "fee_rate": self.cycle.fee_rate,
+            "manual_positions": sorted(self._foreign_pids),
             "auto_resume": self.cycle.auto_resume,
             "halt_resume_in_sec": max(
                 0.0, self.cycle.halt_cooldown_sec - (time.time() - self._halt_ts)
             )
-            if (self._halted and self.cycle.auto_resume and self._halt_ts > 0)
+            if (
+                self._halted
+                and self.cycle.auto_resume
+                and self._halt_ts > 0
+                and self._halt_kind != "ruin"
+            )
             else 0.0,
             "ai_enabled": self._ai_enabled,
             "ai_last_action": (self._ai_last or {}).get("action"),
@@ -1253,6 +1426,9 @@ class GreeksEngine:
         async with self._state_lock:
             t = self.cycle.trade
             sym = t.symbol if t else "?"
+            # The position left the book at an unknown price; crystallise it at
+            # the last mark so the equity curve stays continuous.
+            self._bot_realized += self._unrealized()
             self.cycle.clear()
             self._last_flatten_ts = time.time()
             self._last_fill_ts = 0.0
@@ -1335,6 +1511,40 @@ class GreeksEngine:
                     await rd.delete(flight_key)
         except Exception:
             pass
+
+    async def _scan_foreign_positions(self):
+        """Record Delta positions this bot did not open.
+
+        Contracts the operator bought by hand are not the bot's inventory: it
+        must never size into them, exit them, or count their margin as its own
+        loss. Excluding the product outright is the only safe rule, because a
+        reduce_only order nets against the combined position.
+        """
+        if not (self.client and self.client._auth_ok):
+            return
+        try:
+            positions = await self.client.get_positions()
+        except Exception as exc:
+            await self._log(f"[GUARD] manual position scan failed: {exc}")
+            return
+        async with self._state_lock:
+            own = int(self.cycle.trade.product_id or 0) if self.cycle.trade else 0
+        foreign: Set[int] = set()
+        for row in positions or []:
+            pid = int(
+                row.get("product_id") or (row.get("product") or {}).get("id") or 0
+            )
+            size = int(_f(row.get("size") or row.get("position_size")))
+            if pid and abs(size) > 0 and pid != own:
+                foreign.add(pid)
+        appeared = foreign - self._foreign_pids
+        if appeared:
+            await self._log(
+                f"[GUARD] manual positions protected — excluded product_ids "
+                f"{sorted(appeared)}"
+            )
+        self._foreign_pids = foreign
+        self.cycle.excluded_pids = set(foreign)
 
     async def _confirm_delta_flat(
         self,
@@ -1542,10 +1752,14 @@ class GreeksEngine:
                     if actual_fee is not None and actual_fee > 0
                     else cost * self.cycle.taker_fee
                 )
+                self.cycle.note_fee_observation(fee, cost)
                 self.cycle.arm(executed_sig, fill_px)
                 self.cycle.set_free_capital(
                     self.cycle.free_capital_quote - cost - fee
                 )
+                # Entry fee is realised the moment it is charged; the position
+                # itself is carried as unrealised against its mark.
+                self._bot_realized -= fee
                 await self.store.save_trade_plan(self.cycle.trade_plan_dict())
                 await self.store.save_capital(
                     self.cycle.free_capital_quote,
@@ -1575,7 +1789,9 @@ class GreeksEngine:
                 if actual_fee is not None and actual_fee > 0
                 else fill_px * closed_size * cval * self.cycle.taker_fee
             )
+            self.cycle.note_fee_observation(fee, fill_px * closed_size * cval)
             self._session_pnl += pnl - fee
+            self._bot_realized += pnl - fee
             self.cycle.set_free_capital(
                 self.cycle.free_capital_quote + release + pnl - fee
             )
@@ -1661,6 +1877,9 @@ class GreeksEngine:
                         await self._log(
                             f"[HALT] blocked entries — {self._halt_reason or 'risk'} ({when})"
                         )
+                elif self._risk_block:
+                    if int(time.time()) % 90 < 3:
+                        await self._log(f"[RISK] entries blocked — {self._risk_block}")
                 else:
                     async with self._state_lock:
                         entry = self.cycle.pick_entry(tickers or [])
@@ -1672,18 +1891,57 @@ class GreeksEngine:
                         mom_eth = self.cycle.momentum("ETH")
                         await self._log(
                             f"[SCAN] tickers={len(tickers or [])} "
-                            f"free={self.cycle.free_capital_inr:.4f} "
+                            f"free={self.cycle.free_capital_quote:.4f} "
                             f"budget={self.cycle.budget():.4f} "
                             f"pass={rej.get('pass', 0)} "
                             f"rej dte={rej.get('dte', 0)} spr={rej.get('spread', 0)} "
                             f"atm={rej.get('atm', 0)} δ={rej.get('delta', 0)} "
                             f"mom={rej.get('mom', 0)} side={rej.get('side', 0)} "
-                            f"| mom BTC={mom_btc:+.3%} ETH={mom_eth:+.3%}"
+                            f"edge={rej.get('edge', 0)} held={rej.get('held', 0)} "
+                            f"| mom BTC={mom_btc:+.3%} ETH={mom_eth:+.3%} "
+                            f"fee={self.cycle.fee_rate:.2%}/side"
                         )
                 await self._publish()
             except Exception as e:
                 await self._log(f"[MAIN] {type(e).__name__}: {e}")
             await asyncio.sleep(3)
+
+    async def _reconcile_size(self, pid: int, exchange_size: int):
+        """Shrink to match Delta, but never grow.
+
+        A position larger than the bot's own is the operator trading the same
+        contract. Adopting the surplus would make the bot's next TP, SL, or
+        emergency flatten sell contracts it never bought.
+        """
+        async with self._state_lock:
+            t = self.cycle.trade
+            if not t or int(t.product_id or 0) != pid:
+                return
+            local_size = abs(int(t.size or 0))
+            if exchange_size == local_size:
+                return
+            if exchange_size > local_size:
+                await self._log(
+                    f"[GUARD] Delta holds {exchange_size} vs bot {local_size} on "
+                    f"{t.symbol} — surplus is manual, not adopted"
+                )
+                return
+            scale = exchange_size / local_size if local_size else 0.0
+            # Partially closed by hand: book the difference so the equity curve
+            # does not carry contracts that no longer exist.
+            mark = self._mark_cache.get(t.symbol, 0.0) or t.entry_premium
+            gone = local_size - exchange_size
+            self._bot_realized += (
+                (mark - t.entry_premium) * gone * float(t.contract_value or 1.0)
+            )
+            t.size = exchange_size
+            t.premium_budget = max(0.0, t.premium_budget * scale)
+            t.r_inr = max(0.0, t.r_inr * scale)
+            await self.store.save_trade_plan(self.cycle.trade_plan_dict())
+            await self._log(
+                f"[SYNC] size reduced to Delta → {exchange_size} on {t.symbol} "
+                f"({gone} closed externally)"
+            )
 
     async def sync_loop(self):
         """Keep local open trade aligned with Delta (manual open/close)."""
@@ -1692,6 +1950,8 @@ class GreeksEngine:
                 if not (self.client and self.client._auth_ok):
                     await asyncio.sleep(5)
                     continue
+
+                await self._scan_foreign_positions()
 
                 # Snapshot local SoT; all later mutations re-check under lock.
                 async with self._state_lock:
@@ -1767,22 +2027,7 @@ class GreeksEngine:
                             f"after {self._settle_grace_sec:.0f}s settle grace"
                         )
                     elif abs(matched_size) > 0:
-                        async with self._state_lock:
-                            if (
-                                self.cycle.trade
-                                and int(self.cycle.trade.product_id or 0) == pid
-                                and abs(matched_size)
-                                != abs(int(self.cycle.trade.size or 0))
-                            ):
-                                self.cycle.trade.size = abs(int(matched_size))
-                                await self.store.save_trade_plan(
-                                    self.cycle.trade_plan_dict()
-                                )
-                                await self._log(
-                                    f"[SYNC] size aligned to Delta → "
-                                    f"{self.cycle.trade.size} on "
-                                    f"{self.cycle.trade.symbol}"
-                                )
+                        await self._reconcile_size(pid, abs(int(matched_size)))
 
                 await asyncio.sleep(5)
             except Exception as e:

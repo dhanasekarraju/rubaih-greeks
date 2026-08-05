@@ -2,7 +2,10 @@ exchange:
   name: delta
   # India production API. Global: https://api.delta.exchange
   base_url: "https://api.india.delta.exchange"
-  taker_fee: 0.0005
+  # Delta bills options fees on UNDERLYING notional, not premium, so on cheap
+  # ATM premium the effective rate is huge: measured 1.38% of premium value per
+  # side. Seed only — the engine recalibrates this from actual fills.
+  taker_fee: 0.014
   rest_timeout_sec: 20
 
 trading:
@@ -30,15 +33,22 @@ trading:
     min_dte_days: 1
     max_dte_days: 7
     atm_band_pct: 0.02
-    max_spread_pct: 0.08
+    # 8% was wider than the whole edge: crossing it twice cost more than the
+    # move being traded. Spread is paid twice per round trip.
+    max_spread_pct: 0.03
     # unit_cost = mark * contract_value; ATM lots are often ~0.2–0.5 USDT
     min_mark_premium: 0.15
     min_delta: 0.25
     max_delta: 0.60
     target_delta: 0.40
-    take_profit_premium_pct: 0.35
-    stop_loss_premium_pct: 0.18
-    max_loss_frac: 0.10
+    take_profit_premium_pct: 0.50
+    stop_loss_premium_pct: 0.25
+    # Backstop only — stop_loss_premium_pct is the primary exit. At 0.10 this
+    # fired inside the round-trip friction band, so noise closed every trade.
+    max_loss_frac: 0.30
+    # Reject entries whose delta-implied move cannot clear round-trip friction
+    # by this multiple. This is the gate that enforces positive expectancy.
+    min_edge_multiple: 1.5
     trail_arm_r: 0.7
     trail_giveback_r: 0.4
     trail_giveback_of_peak: 0.25
@@ -46,15 +56,28 @@ trading:
 
 risk:
   kill_switch_on_drawdown: true
-  # Measured on equity (free cash + open premium), peak re-baselined each UTC day
+  # Measured on the BOT's own equity curve (allocation + its realised PnL + its
+  # open position), never on wallet balance: manual trades and transfers move
+  # the wallet without the bot winning or losing anything.
   max_drawdown_pct: 0.15
   max_daily_loss_frac: 0.25
+  # Capital the bot is allowed to risk, in quote units. Drawdown percentages are
+  # measured against this, not against whatever happens to be in the wallet.
+  bot_allocation_quote: 11.5
+  # Refuse to trade below this free balance instead of grinding a book to dust
+  min_free_quote: 1.0
+  # Terminal stop: realised loss this deep needs a human, never a timer
+  max_total_loss_frac: 0.35
+  # A drawdown halt clears only once drawdown recovers under this share of the
+  # limit. Timers must never move the high-water mark.
+  halt_recover_frac: 0.7
   # Consecutive breaching reads needed to halt (filters wallet/mark blips)
   halt_confirm_readings: 2
   # Never ghost-clear a newly filled option while Delta positions are settling
   position_settle_grace_sec: 30
   flat_confirm_readings: 2
-  # Halt clears itself after the cooldown — no VPS/manual resume needed
+  # Halts self-clear only when the breached condition itself clears (daily loss
+  # at UTC rollover, drawdown once recovered). A ruin halt always needs a human.
   auto_resume: true
   halt_cooldown_min: 60
   emergency_flatten: true
