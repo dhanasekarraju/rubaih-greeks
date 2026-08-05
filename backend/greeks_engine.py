@@ -15,8 +15,9 @@ import json
 import math
 import re
 import os
+import secrets
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -27,6 +28,7 @@ import yaml
 from dotenv import load_dotenv
 
 from ai_advisor import GreeksAI, AIDecision, ai_configured
+from command_bus import verify_command
 from delta_client import DeltaClient, DeltaAPIError, env_delta_client
 
 load_dotenv()
@@ -35,6 +37,11 @@ ROOT = Path(__file__).resolve().parent
 CFG = yaml.safe_load((ROOT / "config.yaml").read_text())
 
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").strip().lower() in ("1", "true", "yes")
+COMMAND_SECRET = (
+    os.getenv("RUBAIH_GREEKS_API_TOKEN")
+    or os.getenv("RUBAIH_API_TOKEN")
+    or ""
+).strip()
 FREE_SEED = float(
     os.getenv("RUBAIH_GREEKS_FREE_INR")
     or os.getenv("FREE_CAPITAL_INR")
@@ -115,7 +122,10 @@ class OptionsCycle:
         self.allow_sell_premium = bool(t.get("allow_sell_premium", False))
         self.capital_inr = float(t.get("capital_inr", 1000))
         self.usdt_inr = float(t.get("usdt_inr", 87))
-        self.free_capital_inr = self.capital_inr
+        # Canonical sizing unit is quote currency (USDT for Delta options).
+        # free_capital_inr remains a synchronized legacy alias for API/mobile.
+        self.free_capital_quote = self.capital_inr / max(self.usdt_inr, 1.0)
+        self.free_capital_inr = self.free_capital_quote
         self.margin_use_frac = float(t.get("margin_use_frac", 0.20))
         self.margin_use_max_frac = float(t.get("margin_use_max_frac", 0.25))
         self.max_premium_budget = float(t.get("max_premium_budget_usdt", 2.0))
@@ -152,11 +162,13 @@ class OptionsCycle:
         self.trade: Optional[OpenTrade] = None
 
     def set_free_capital(self, free: float):
-        if free and free > 0:
-            self.free_capital_inr = float(free)
+        value = max(0.0, float(free or 0.0))
+        self.free_capital_quote = value
+        self.free_capital_inr = value
 
     def budget(self) -> float:
-        free = max(self.free_capital_inr, 0.0) or max(self.capital_inr, 0.0)
+        # Never fall back from zero quote balance to raw INR configuration.
+        free = max(self.free_capital_quote, 0.0)
         lo = max(0.05, min(self.margin_use_frac, self.margin_use_max_frac))
         hi = max(lo, min(0.95, self.margin_use_max_frac))
         use = min(max(self.margin_use_frac, lo), hi)
@@ -623,7 +635,8 @@ class Store:
         await self.rd.hset(
             "greeks:settings",
             mapping={
-                "free_capital_inr": f"{free:.2f}",
+                "free_capital_inr": f"{free:.4f}",  # legacy quote-unit alias
+                "free_capital_quote": f"{free:.4f}",
                 "free_quote": f"{free:.4f}",
                 "quote_ccy": ccy,
                 "free_inr_approx": f"{inr_approx:.2f}",
@@ -811,6 +824,20 @@ class GreeksEngine:
         self._halt_ts = 0.0
         self._breach_count = 0
         self._equity = 0.0
+        self._order_flight_ttl_sec = 90
+        # Single writer boundary for cycle.trade + canonical free quote balance.
+        self._state_lock = asyncio.Lock()
+        # Serializes exchange order lifecycles across BUY, SELL, halt, and panic.
+        self._order_lock = asyncio.Lock()
+        risk_cfg = CFG.get("risk") or {}
+        self._settle_grace_sec = max(
+            10.0, float(risk_cfg.get("position_settle_grace_sec", 30))
+        )
+        self._flat_confirm_count = 0
+        self._flat_confirms_needed = max(
+            2, int(risk_cfg.get("flat_confirm_readings", 2))
+        )
+        self._entry_blocked = False
 
     async def _log(self, line: str):
         print(line)
@@ -820,6 +847,10 @@ class GreeksEngine:
             pass
 
     async def start(self):
+        if len(COMMAND_SECRET) < 16:
+            raise RuntimeError(
+                "RUBAIH_GREEKS_API_TOKEN (or RUBAIH_API_TOKEN) must be >=16 chars"
+            )
         await self.store.connect()
         self.client = env_delta_client(CFG)
         plan = await self.store.load_trade_plan()
@@ -871,25 +902,38 @@ class GreeksEngine:
         await asyncio.gather(*tasks)
 
     async def _refresh_capital(self, force: bool = False):
-        # Prefer live wallet quote (USDT on Delta India options); else ledger; else seed
-        free = 0.0
+        """Refresh canonical free collateral in USDT quote units."""
+        free_quote = 0.0
         source = "unknown"
         quote_ccy = "USDT"
         wallet_rows: List[Dict] = []
+        wallet_authoritative = False
+
+        def available_value(row: Dict) -> float:
+            for key in (
+                "available_balance",
+                "available_balance_for_margin",
+                "balance",
+            ):
+                if key in row and row.get(key) is not None:
+                    return max(0.0, _f(row.get(key)))
+            return 0.0
+
         if self.client and self.client._auth_ok:
             try:
                 bals = await self.client.get_balances()
                 wallet_rows = []
-                best_usdt = 0.0
-                best_inr = 0.0
+                best_usdt: Optional[float] = None
+                best_inr: Optional[float] = None
                 for b in bals or []:
                     ccy = str(b.get("asset_symbol") or b.get("currency") or "").upper()
-                    avail = _f(
-                        b.get("available_balance")
-                        or b.get("available_balance_for_margin")
-                        or b.get("balance")
+                    avail = available_value(b)
+                    total = _f(
+                        b.get("balance")
+                        if b.get("balance") is not None
+                        else b.get("wallet_balance"),
+                        avail,
                     )
-                    total = _f(b.get("balance") or b.get("wallet_balance") or avail)
                     if ccy:
                         wallet_rows.append(
                             {
@@ -898,55 +942,79 @@ class GreeksEngine:
                                 "balance": total,
                             }
                         )
-                    if ccy in ("USDT", "USD", "USDC") and avail > best_usdt:
-                        best_usdt = avail
-                    if ccy == "INR" and avail > best_inr:
-                        best_inr = avail
-                # Delta India options are USDT-quoted — prefer USDT wallet for sizing
-                if best_usdt > 0:
-                    free = best_usdt
+                    if ccy in ("USDT", "USD", "USDC"):
+                        best_usdt = max(best_usdt or 0.0, avail)
+                    if ccy == "INR":
+                        best_inr = max(best_inr or 0.0, avail)
+                # Presence of a USDT row is authoritative even when exactly zero.
+                if best_usdt is not None:
+                    free_quote = best_usdt
                     quote_ccy = "USDT"
                     source = "wallet:USDT"
-                elif best_inr > 0:
-                    free = best_inr
-                    quote_ccy = "INR"
-                    source = "wallet:INR"
+                    wallet_authoritative = True
+                elif best_inr is not None:
+                    # Premiums are USDT quoted; convert INR collateral before sizing.
+                    free_quote = best_inr / max(self.cycle.usdt_inr, 1.0)
+                    quote_ccy = "USDT"
+                    source = "wallet:INR→USDT"
+                    wallet_authoritative = True
             except Exception as e:
                 await self._log(f"[CAPITAL] wallet error: {e}")
-        if free <= 0:
+
+        ledger_present = False
+        if not wallet_authoritative:
             ledger = await self.store.load_capital()
-            free = _f(ledger.get("free_quote") or ledger.get("free_inr"))
-            if free > 0:
-                quote_ccy = str(ledger.get("quote_ccy") or "USDT").upper()
+            if "free_quote" in ledger or "free_inr" in ledger:
+                ledger_present = True
+                free_quote = max(
+                    0.0,
+                    _f(
+                        ledger.get("free_quote")
+                        if ledger.get("free_quote") is not None
+                        else ledger.get("free_inr")
+                    ),
+                )
+                stored_ccy = str(ledger.get("quote_ccy") or "USDT").upper()
+                if stored_ccy == "INR":
+                    free_quote /= max(self.cycle.usdt_inr, 1.0)
                 source = "ledger"
-        if free <= 0 and FREE_SEED > 0:
+                quote_ccy = "USDT"
+
+        if not wallet_authoritative and not ledger_present and FREE_SEED > 0:
             # Env seed is INR intent; convert once to USDT quote for sizing
-            free = FREE_SEED / max(self.cycle.usdt_inr, 1.0)
+            free_quote = FREE_SEED / max(self.cycle.usdt_inr, 1.0)
             quote_ccy = "USDT"
             source = "env_seed_inr_to_usdt"
-            await self.store.save_capital(free, source, quote_ccy, self.cycle.usdt_inr)
+            await self.store.save_capital(
+                free_quote, source, quote_ccy, self.cycle.usdt_inr
+            )
             await self._log(
-                f"[CAPITAL] seeded ₹{FREE_SEED:.0f} → {free:.4f} USDT "
+                f"[CAPITAL] seeded ₹{FREE_SEED:.0f} → {free_quote:.4f} USDT "
                 f"(÷ usdt_inr={self.cycle.usdt_inr:.0f}) day-1 posture"
             )
-        if free <= 0:
-            free = self.cycle.capital_inr / max(self.cycle.usdt_inr, 1.0)
+        if not wallet_authoritative and not ledger_present and FREE_SEED <= 0:
+            free_quote = self.cycle.capital_inr / max(self.cycle.usdt_inr, 1.0)
             quote_ccy = "USDT"
-            source = "config"
-        self.cycle.set_free_capital(free)
-        self._capital_source = source
-        self._quote_ccy = quote_ccy
-        self._last_capital_refresh = time.time()
-        await self.store.save_capital(free, source, quote_ccy, self.cycle.usdt_inr)
+            source = "config_seed"
+
+        async with self._state_lock:
+            self.cycle.set_free_capital(free_quote)
+            self._capital_source = source
+            self._quote_ccy = "USDT"
+            self._last_capital_refresh = time.time()
+            await self.store.save_capital(
+                free_quote, source, "USDT", self.cycle.usdt_inr
+            )
         await self.store.save_wallet_snapshot(
-            wallet_rows, free, source, quote_ccy, self.cycle.usdt_inr
+            wallet_rows, free_quote, source, "USDT", self.cycle.usdt_inr
         )
         if force:
-            inr = free * self.cycle.usdt_inr if quote_ccy in ("USDT", "USD", "USDC") else free
+            inr = free_quote * self.cycle.usdt_inr
             await self._log(
-                f"[CAPITAL] free={free:.4f} {quote_ccy} (≈₹{inr:.0f}) source={source}"
+                f"[CAPITAL] free={free_quote:.4f} USDT "
+                f"(≈₹{inr:.0f}) source={source}"
             )
-        await self._update_risk_after_capital(free)
+        await self._update_risk_after_capital(free_quote)
 
     async def _load_halt_state(self):
         self._halted = await self.store.is_halted()
@@ -991,7 +1059,7 @@ class GreeksEngine:
         Equity = free cash + open premium value. Cash alone drops by the whole
         premium the moment a trade opens, which used to look like a drawdown.
         """
-        if free <= 0:
+        if free < 0:
             return
         equity = free + self._position_value()
         self._equity = equity
@@ -1065,38 +1133,42 @@ class GreeksEngine:
             else "manual resume required"
         )
         await self._log(f"[HALT] {reason} — flatten open trade; block entries ({cooldown})")
-        t = self.cycle.trade
-        if t:
-            mark = self._mark_cache.get(t.symbol, t.entry_premium)
-            sig = Signal(
-                action="SELL",
-                symbol=t.symbol,
-                product_id=t.product_id,
-                size=t.size,
-                premium=mark if mark > 0 else t.entry_premium,
-                underlying=t.underlying,
-                option_type=t.option_type,
-                strike=t.strike,
-                contract_value=t.contract_value,
-                reason=f"EXIT_HALT: {reason}",
-            )
-            await self._execute(sig)
+        async with self._order_lock:
+            async with self._state_lock:
+                t = replace(self.cycle.trade) if self.cycle.trade else None
+            if t:
+                mark = self._mark_cache.get(t.symbol, t.entry_premium)
+                sig = Signal(
+                    action="SELL",
+                    symbol=t.symbol,
+                    product_id=t.product_id,
+                    size=t.size,
+                    premium=mark if mark > 0 else t.entry_premium,
+                    underlying=t.underlying,
+                    option_type=t.option_type,
+                    strike=t.strike,
+                    contract_value=t.contract_value,
+                    reason=f"EXIT_HALT: {reason}",
+                )
+                await self._execute_serialized(sig)
         await self.store.set_status("halted", reason)
 
     async def _clear_halt(self, note: str = "operator resume"):
-        self._halted = False
-        self._halt_reason = ""
-        self._halt_ts = 0.0
-        self._breach_count = 0
-        await self.store.set_halted(False)
-        # Re-baseline to current equity so we don't immediately re-halt
-        equity = float(self.cycle.free_capital_inr or 0) + self._position_value()
-        if equity > 0:
-            self._peak_free = equity
-            self._day_start_free = equity
-            self._day_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            self._drawdown_pct = 0.0
-        await self._persist_risk_state()
+        async with self._state_lock:
+            self._halted = False
+            self._halt_reason = ""
+            self._halt_ts = 0.0
+            self._breach_count = 0
+            self._entry_blocked = False
+            await self.store.set_halted(False)
+            # Re-baseline to current equity so we don't immediately re-halt
+            equity = self.cycle.free_capital_quote + self._position_value()
+            if equity >= 0:
+                self._peak_free = equity
+                self._day_start_free = equity
+                self._day_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                self._drawdown_pct = 0.0
+            await self._persist_risk_state()
         await self.store.set_status("running")
         await self._log(
             f"[HALT] Cleared ({note}) — entries allowed again, baseline={equity:.4f}"
@@ -1117,10 +1189,12 @@ class GreeksEngine:
         return True
 
     async def _publish(self):
-        t = self.cycle.trade
+        async with self._state_lock:
+            t = replace(self.cycle.trade) if self.cycle.trade else None
+            free = float(self.cycle.free_capital_quote)
+            budget = self.cycle.budget()
         mark = self._mark_cache.get(t.symbol, 0.0) if t else 0.0
         upnl = ((mark - t.entry_premium) * t.size * float(t.contract_value or 1.0)) if t and mark > 0 else 0.0
-        free = float(self.cycle.free_capital_inr or 0)
         ccy = getattr(self, "_quote_ccy", "USDT") or "USDT"
         inr_approx = free * float(self.cycle.usdt_inr) if ccy in ("USDT", "USD", "USDC") else free
         snap = {
@@ -1128,12 +1202,13 @@ class GreeksEngine:
             "mode": "options_cycle",
             "live": self._live,
             "free_capital_inr": free,  # legacy: quote units used for sizing
+            "free_capital_quote": free,
             "free_quote": free,
             "quote_ccy": ccy,
             "free_inr_approx": inr_approx,
             "usdt_inr": self.cycle.usdt_inr,
-            "budget_inr": self.cycle.budget(),
-            "budget_quote": self.cycle.budget(),
+            "budget_inr": budget,  # legacy quote-unit alias
+            "budget_quote": budget,
             "capital_source": self._capital_source,
             "session_pnl": self._session_pnl + upnl,
             "halted": self._halted,
@@ -1175,106 +1250,363 @@ class GreeksEngine:
 
     async def _clear_external_flat(self, reason: str, refresh_wallet: bool = True):
         """Delta already flat (manual close / reduce_only empty) — drop local ghost."""
-        t = self.cycle.trade
-        sym = t.symbol if t else "?"
+        async with self._state_lock:
+            t = self.cycle.trade
+            sym = t.symbol if t else "?"
+            self.cycle.clear()
+            self._last_flatten_ts = time.time()
+            self._last_fill_ts = 0.0
+            self._flat_confirm_count = 0
+            await self.store.save_trade_plan({})
+            if not refresh_wallet:
+                await self.store.save_capital(
+                    self.cycle.free_capital_quote,
+                    "ledger",
+                    "USDT",
+                    self.cycle.usdt_inr,
+                )
         await self._log(f"[SYNC] Clearing local trade {sym} — {reason}")
-        self.cycle.clear()
-        self._last_flatten_ts = time.time()
-        self._last_fill_ts = 0.0
-        await self.store.save_trade_plan({})
         if refresh_wallet:
             await self._refresh_capital(force=True)
-        else:
-            await self.store.save_capital(
-                self.cycle.free_capital_inr,
-                "ledger",
-                getattr(self, "_quote_ccy", "USDT"),
-                self.cycle.usdt_inr,
-            )
         await self._publish()
 
-    async def _execute(self, sig: Signal):
+    def _new_client_order_id(self, sig: Signal) -> str:
+        """Delta client ids are limited to 32 characters."""
+        side = "b" if sig.action == "BUY" else "s"
+        return f"rg{side}{int(time.time() * 1000)}{secrets.token_hex(5)}"[:32]
+
+    async def _claim_order(self, sig: Signal, client_order_id: str) -> bool:
+        """Fail closed unless Redis atomically claims id + product/side flight."""
+        rd = self.store.rd
+        if not rd:
+            await self._log("[ORDER] Redis unavailable — idempotency claim blocked")
+            return False
+        flight_key = f"greeks:orderflight:{sig.product_id}:{sig.action.lower()}"
+        try:
+            claimed = await rd.set(
+                f"greeks:coid:{client_order_id}",
+                json.dumps(
+                    {
+                        "status": "pending",
+                        "product_id": sig.product_id,
+                        "side": sig.action.lower(),
+                        "ts": time.time(),
+                    }
+                ),
+                nx=True,
+                ex=86400,
+            )
+            if not claimed:
+                return False
+            flight = await rd.set(
+                flight_key,
+                client_order_id,
+                nx=True,
+                ex=self._order_flight_ttl_sec,
+            )
+            if not flight:
+                await rd.delete(f"greeks:coid:{client_order_id}")
+                return False
+            return True
+        except Exception as exc:
+            await self._log(f"[ORDER] Redis idempotency claim failed: {exc}")
+            return False
+
+    async def _finish_order_claim(
+        self,
+        sig: Signal,
+        client_order_id: str,
+        result: Dict,
+        release_flight: bool,
+    ):
+        rd = self.store.rd
+        if not rd:
+            return
+        flight_key = f"greeks:orderflight:{sig.product_id}:{sig.action.lower()}"
+        try:
+            await rd.set(
+                f"greeks:coid:{client_order_id}",
+                json.dumps(result, default=str),
+                ex=86400,
+            )
+            if release_flight:
+                current = await rd.get(flight_key)
+                if current == client_order_id:
+                    await rd.delete(flight_key)
+        except Exception:
+            pass
+
+    async def _confirm_delta_flat(
+        self,
+        product_id: int,
+        reads: int = 3,
+        delay_sec: float = 0.8,
+    ) -> Tuple[bool, int]:
+        """Require consecutive authoritative position reads before declaring flat."""
+        if not (self.client and self.client._auth_ok and product_id):
+            return False, 0
+        last_size = 0
+        for idx in range(max(1, reads)):
+            try:
+                positions = await self.client.get_positions(product_id=product_id)
+            except Exception as exc:
+                await self._log(f"[ORDER] flat confirm failed: {exc}")
+                return False, last_size
+            last_size = 0
+            for row in positions or []:
+                pid = int(
+                    row.get("product_id")
+                    or (row.get("product") or {}).get("id")
+                    or 0
+                )
+                if pid == int(product_id):
+                    last_size = int(_f(row.get("size") or row.get("position_size")))
+                    break
+            if abs(last_size) > 0:
+                return False, last_size
+            if idx < reads - 1:
+                await asyncio.sleep(delay_sec)
+        return True, 0
+
+    async def _execute(self, sig: Signal) -> bool:
+        async with self._order_lock:
+            return await self._execute_serialized(sig)
+
+    async def _execute_serialized(self, sig: Signal) -> bool:
         await self._log(f"[SIGNAL] {sig.reason}")
+        if sig.action == "BUY" and (
+            not self._running or self._halted or self._entry_blocked
+        ):
+            await self._log("[ORDER] BUY blocked — engine halted/stopping")
+            return False
         if sig.action == "BUY" and self.cycle.allow_sell_premium is False:
             pass  # buy path only
         live_ok = self._live and self.client and self.client._auth_ok
         fill_px = sig.premium
+        filled_size = int(sig.size)
+        actual_fee: Optional[float] = None
         if live_ok:
+            client_order_id = self._new_client_order_id(sig)
+            if not await self._claim_order(sig, client_order_id):
+                await self._log(
+                    f"[ORDER] blocked duplicate/in-flight {sig.action} "
+                    f"product={sig.product_id}"
+                )
+                return False
+            # Begin settle grace before POST so sync cannot ghost-clear while
+            # the order lifecycle is still awaiting Delta/fill history.
+            async with self._state_lock:
+                self._last_fill_ts = time.time()
+                self._flat_confirm_count = 0
+            started_at_us = int(time.time() * 1_000_000)
+            initial: Dict = {}
+            submit_error = ""
             try:
                 if sig.action == "BUY":
-                    await self.client.place_order(
-                        sig.product_id, sig.size, "buy", order_type="market_order"
+                    initial = await self.client.place_order(
+                        sig.product_id,
+                        sig.size,
+                        "buy",
+                        order_type="market_order",
+                        client_order_id=client_order_id,
                     )
                 else:
-                    await self.client.place_order(
+                    initial = await self.client.place_order(
                         sig.product_id,
                         sig.size,
                         "sell",
                         order_type="market_order",
                         reduce_only=True,
+                        client_order_id=client_order_id,
                     )
-                self._last_fill_ts = time.time()
-                await self._log(f"[FILL] LIVE {sig.action} {sig.symbol} size={sig.size}")
             except Exception as e:
-                await self._log(f"[ORDER] failed: {e}")
+                submit_error = str(e)
+                await self._log(
+                    f"[ORDER] POST ambiguous coid={client_order_id}: {e}; "
+                    "querying Delta by client id (no blind retry)"
+                )
                 code = getattr(e, "code", "") or ""
                 text = str(e).lower()
-                # Manual close on Delta / already flat — stop EXIT loops
+                # Reduce-only error is not enough to clear SoT; sync/flat confirm must.
                 if sig.action == "SELL" and (
                     code == "no_position_for_reduce_only"
                     or "no_position_for_reduce_only" in text
                 ):
-                    await self._clear_external_flat(
-                        "Delta no_position_for_reduce_only (already flat)"
-                    )
-                return
-        else:
-            await self._log(f"[DRY] {sig.action} {sig.symbol} size={sig.size} @ {fill_px:.4f}")
-            self._last_fill_ts = time.time()
+                    flat, _ = await self._confirm_delta_flat(sig.product_id)
+                    if flat:
+                        await self._clear_external_flat(
+                            "Delta flat confirmed after no_position_for_reduce_only"
+                        )
+                        await self._finish_order_claim(
+                            sig,
+                            client_order_id,
+                            {"status": "already_flat", "error": submit_error},
+                            release_flight=True,
+                        )
+                        return True
 
-        await self.store.save_trade(sig)
-        if sig.action == "BUY":
-            cval = float(sig.contract_value or 1.0)
-            cost = fill_px * sig.size * cval
-            fee = cost * self.cycle.taker_fee
-            self.cycle.arm(sig, fill_px)
-            self.cycle.set_free_capital(max(0.0, self.cycle.free_capital_inr - cost - fee))
-            await self.store.save_trade_plan(self.cycle.trade_plan_dict())
-            await self.store.save_capital(
-                self.cycle.free_capital_inr,
-                "ledger",
-                getattr(self, "_quote_ccy", "USDT"),
-                self.cycle.usdt_inr,
-            )
-            self._capital_source = "ledger"
-        else:
-            t = self.cycle.trade
-            pnl = 0.0
-            release = 0.0
-            if t:
-                cval = float(t.contract_value or 1.0)
-                pnl = (fill_px - t.entry_premium) * t.size * cval
-                release = t.premium_budget
-                fee = fill_px * t.size * cval * self.cycle.taker_fee
-                self._session_pnl += pnl - fee
-                self.cycle.set_free_capital(
-                    max(0.0, self.cycle.free_capital_inr + release + pnl - fee)
+            order_id = str(initial.get("id") or "") if isinstance(initial, dict) else ""
+            try:
+                resolved = await self.client.resolve_order_fill(
+                    requested_size=sig.size,
+                    product_id=sig.product_id,
+                    order_id=order_id or None,
+                    client_order_id=client_order_id,
+                    initial=initial if isinstance(initial, dict) else None,
+                    timeout_sec=12.0,
+                    poll_sec=0.35,
+                    started_at_us=started_at_us,
                 )
-            self.cycle.clear()
-            self._last_flatten_ts = time.time()
-            await self.store.save_trade_plan({})
+            except Exception as exc:
+                await self._log(
+                    f"[ORDER] reconciliation failed coid={client_order_id}: {exc}"
+                )
+                await self._finish_order_claim(
+                    sig,
+                    client_order_id,
+                    {"status": "ambiguous", "error": submit_error or str(exc)},
+                    release_flight=False,
+                )
+                return False
+
+            filled_size = int(resolved.get("filled_size") or 0)
+            fill_px = _f(resolved.get("avg_price"))
+            actual_fee = _f(resolved.get("fee"))
+            terminal = bool(resolved.get("terminal"))
+            await self._finish_order_claim(
+                sig,
+                client_order_id,
+                {
+                    "status": resolved.get("state"),
+                    "order_id": resolved.get("order_id"),
+                    "filled_size": filled_size,
+                    "avg_price": fill_px,
+                    "fee": actual_fee,
+                    "requested_size": sig.size,
+                    "ts": time.time(),
+                },
+                release_flight=terminal,
+            )
+            if not resolved.get("confirmed") or filled_size <= 0 or fill_px <= 0:
+                await self._log(
+                    f"[ORDER] no confirmed execution coid={client_order_id} "
+                    f"state={resolved.get('state')} — local SoT unchanged"
+                )
+                return False
+
+            async with self._state_lock:
+                self._last_fill_ts = time.time()
+                self._flat_confirm_count = 0
+            partial = filled_size < int(sig.size)
+            await self._log(
+                f"[FILL] LIVE {sig.action} {sig.symbol} "
+                f"filled={filled_size}/{sig.size} avg={fill_px:.6f} "
+                f"state={resolved.get('state')} fee={actual_fee:.6f}"
+                f"{' PARTIAL' if partial else ''}"
+            )
+        else:
+            await self._log(
+                f"[DRY] {sig.action} {sig.symbol} size={filled_size} @ {fill_px:.4f}"
+            )
+            async with self._state_lock:
+                self._last_fill_ts = time.time()
+                self._flat_confirm_count = 0
+
+        applied, fully_closed, refresh_wallet = await self._apply_confirmed_execution(
+            sig,
+            filled_size,
+            fill_px,
+            actual_fee,
+        )
+        if refresh_wallet:
+            # Network I/O is outside the state mutex; publish is locked internally.
+            await self._refresh_capital(force=True)
+        return applied if sig.action == "BUY" else fully_closed
+
+    async def _apply_confirmed_execution(
+        self,
+        sig: Signal,
+        filled_size: int,
+        fill_px: float,
+        actual_fee: Optional[float],
+    ) -> Tuple[bool, bool, bool]:
+        """Atomically mutate trade, free quote, and persisted plan/ledger."""
+        async with self._state_lock:
+            executed_sig = replace(sig, size=filled_size, premium=fill_px)
+            await self.store.save_trade(executed_sig)
+            if sig.action == "BUY":
+                cval = float(sig.contract_value or 1.0)
+                cost = fill_px * filled_size * cval
+                fee = (
+                    actual_fee
+                    if actual_fee is not None and actual_fee > 0
+                    else cost * self.cycle.taker_fee
+                )
+                self.cycle.arm(executed_sig, fill_px)
+                self.cycle.set_free_capital(
+                    self.cycle.free_capital_quote - cost - fee
+                )
+                await self.store.save_trade_plan(self.cycle.trade_plan_dict())
+                await self.store.save_capital(
+                    self.cycle.free_capital_quote,
+                    "ledger",
+                    "USDT",
+                    self.cycle.usdt_inr,
+                )
+                self._capital_source = "ledger"
+                self._flat_confirm_count = 0
+                return True, False, False
+
+            t = self.cycle.trade
+            if not t:
+                await self._log(
+                    "[ORDER] confirmed SELL but no local trade; "
+                    "wallet/position sync required"
+                )
+                return False, False, True
+
+            original_size = max(1, int(t.size))
+            closed_size = min(filled_size, original_size)
+            cval = float(t.contract_value or 1.0)
+            pnl = (fill_px - t.entry_premium) * closed_size * cval
+            release = t.premium_budget * (closed_size / original_size)
+            fee = (
+                actual_fee
+                if actual_fee is not None and actual_fee > 0
+                else fill_px * closed_size * cval * self.cycle.taker_fee
+            )
+            self._session_pnl += pnl - fee
+            self.cycle.set_free_capital(
+                self.cycle.free_capital_quote + release + pnl - fee
+            )
+            remaining = original_size - closed_size
+            if remaining <= 0:
+                self.cycle.clear()
+                self._last_flatten_ts = time.time()
+                self._flat_confirm_count = 0
+                await self.store.save_trade_plan({})
+            else:
+                t.size = remaining
+                t.premium_budget = max(0.0, t.premium_budget - release)
+                t.r_inr = max(0.0, t.r_inr * (remaining / original_size))
+                await self.store.save_trade_plan(self.cycle.trade_plan_dict())
+                await self._log(
+                    f"[ORDER] partial exit retained local risk size={remaining} "
+                    f"on {t.symbol}"
+                )
             await self.store.save_capital(
-                self.cycle.free_capital_inr,
+                self.cycle.free_capital_quote,
                 "ledger",
-                getattr(self, "_quote_ccy", "USDT"),
+                "USDT",
                 self.cycle.usdt_inr,
             )
             self._capital_source = "ledger"
             await self._log(
-                f"[FLAT] pnl≈{pnl:.2f} free={self.cycle.free_capital_inr:.2f}"
+                f"[{'FLAT' if remaining <= 0 else 'PARTIAL'}] "
+                f"closed={closed_size} pnl≈{pnl:.4f} "
+                f"free={self.cycle.free_capital_quote:.4f} USDT"
             )
-            # Authoritative free from Delta after exit
-            await self._refresh_capital(force=True)
+            return True, remaining <= 0, True
 
     async def main_loop(self):
         while self._running:
@@ -1286,8 +1618,10 @@ class GreeksEngine:
                     await self._refresh_capital(force=False)
                 tickers = await self.client.get_option_tickers(self.cycle.underlyings)
                 # refresh marks for open trade
-                if self.cycle.trade:
-                    sym = self.cycle.trade.symbol
+                async with self._state_lock:
+                    active_trade = replace(self.cycle.trade) if self.cycle.trade else None
+                if active_trade:
+                    sym = active_trade.symbol
                     try:
                         tk = await self.client.get_ticker(sym)
                         if tk:
@@ -1298,9 +1632,17 @@ class GreeksEngine:
                             dlt = _f(g.get("delta") or tk.get("delta"))
                             if dlt != 0:
                                 self._delta_cache[sym] = dlt
-                            exit_sig = self.cycle.evaluate_exit(
-                                mark if mark > 0 else self._mark_cache.get(sym, 0)
-                            )
+                            async with self._state_lock:
+                                exit_sig = None
+                                if self.cycle.trade and self.cycle.trade.symbol == sym:
+                                    exit_sig = self.cycle.evaluate_exit(
+                                        mark
+                                        if mark > 0
+                                        else self._mark_cache.get(sym, 0)
+                                    )
+                                    await self.store.save_trade_plan(
+                                        self.cycle.trade_plan_dict()
+                                    )
                             if exit_sig:
                                 await self._execute(exit_sig)
                     except Exception as e:
@@ -1320,7 +1662,8 @@ class GreeksEngine:
                             f"[HALT] blocked entries — {self._halt_reason or 'risk'} ({when})"
                         )
                 else:
-                    entry = self.cycle.pick_entry(tickers or [])
+                    async with self._state_lock:
+                        entry = self.cycle.pick_entry(tickers or [])
                     if entry:
                         await self._execute(entry)
                     elif int(time.time()) % 60 < 3:
@@ -1350,9 +1693,13 @@ class GreeksEngine:
                     await asyncio.sleep(5)
                     continue
 
-                # Always poll Delta when we think we have a local trade
-                if self.cycle.trade:
-                    pid = int(self.cycle.trade.product_id or 0)
+                # Snapshot local SoT; all later mutations re-check under lock.
+                async with self._state_lock:
+                    local_trade = (
+                        replace(self.cycle.trade) if self.cycle.trade else None
+                    )
+                if local_trade:
+                    pid = int(local_trade.product_id or 0)
                     try:
                         positions = await self.client.get_positions(product_id=pid or None)
                     except Exception as e:
@@ -1374,28 +1721,68 @@ class GreeksEngine:
                         if pid and p_pid == pid:
                             matched_size = size
 
-                    # Restored plans after restart: _last_fill_ts may be 0 — still clear if Delta flat
-                    age_ok = (
-                        self._last_fill_ts <= 0
-                        or time.time() - self._last_fill_ts > 8
-                    )
-                    ghost = age_ok and abs(matched_size) == 0 and (
+                    exchange_flat = abs(matched_size) == 0 and (
                         not pid or pid not in open_pids
                     )
-                    if ghost:
+                    should_clear = False
+                    if exchange_flat:
+                        age = (
+                            float("inf")
+                            if self._last_fill_ts <= 0
+                            else time.time() - self._last_fill_ts
+                        )
+                        async with self._state_lock:
+                            same_trade = (
+                                self.cycle.trade
+                                and int(self.cycle.trade.product_id or 0) == pid
+                            )
+                            if not same_trade:
+                                self._flat_confirm_count = 0
+                            elif age < self._settle_grace_sec:
+                                self._flat_confirm_count = 0
+                                await self._log(
+                                    f"[SYNC] defer flat {local_trade.symbol} — "
+                                    f"settle grace {age:.0f}/{self._settle_grace_sec:.0f}s"
+                                )
+                            else:
+                                self._flat_confirm_count += 1
+                                should_clear = (
+                                    self._flat_confirm_count
+                                    >= self._flat_confirms_needed
+                                )
+                                if not should_clear:
+                                    await self._log(
+                                        f"[SYNC] flat confirm "
+                                        f"{self._flat_confirm_count}/"
+                                        f"{self._flat_confirms_needed} "
+                                        f"for {local_trade.symbol}"
+                                    )
+                    else:
+                        async with self._state_lock:
+                            self._flat_confirm_count = 0
+
+                    if should_clear:
                         await self._clear_external_flat(
-                            "Delta position size=0 (manual/external close)"
+                            f"Delta flat confirmed {self._flat_confirms_needed}x "
+                            f"after {self._settle_grace_sec:.0f}s settle grace"
                         )
-                    elif abs(matched_size) > 0 and abs(matched_size) != abs(
-                        int(self.cycle.trade.size or 0)
-                    ):
-                        # Size changed on exchange — adopt Delta size
-                        self.cycle.trade.size = abs(int(matched_size))
-                        await self.store.save_trade_plan(self.cycle.trade_plan_dict())
-                        await self._log(
-                            f"[SYNC] size aligned to Delta → {self.cycle.trade.size} "
-                            f"on {self.cycle.trade.symbol}"
-                        )
+                    elif abs(matched_size) > 0:
+                        async with self._state_lock:
+                            if (
+                                self.cycle.trade
+                                and int(self.cycle.trade.product_id or 0) == pid
+                                and abs(matched_size)
+                                != abs(int(self.cycle.trade.size or 0))
+                            ):
+                                self.cycle.trade.size = abs(int(matched_size))
+                                await self.store.save_trade_plan(
+                                    self.cycle.trade_plan_dict()
+                                )
+                                await self._log(
+                                    f"[SYNC] size aligned to Delta → "
+                                    f"{self.cycle.trade.size} on "
+                                    f"{self.cycle.trade.symbol}"
+                                )
 
                 await asyncio.sleep(5)
             except Exception as e:
@@ -1405,11 +1792,35 @@ class GreeksEngine:
     async def command_loop(self):
         while self._running:
             try:
-                cmd = await self.store.pop_command()
-                if not cmd:
+                raw = await self.store.pop_command()
+                if not raw:
                     await asyncio.sleep(1)
                     continue
-                cmd = cmd.strip().lower()
+                try:
+                    payload = json.loads(raw)
+                except (TypeError, json.JSONDecodeError):
+                    await self._log("[CMD] rejected unsigned legacy command")
+                    continue
+                if not verify_command(COMMAND_SECRET, payload):
+                    await self._log("[CMD] rejected invalid/expired HMAC command")
+                    continue
+                nonce = str(payload.get("nonce") or "")
+                try:
+                    fresh = await self.store.rd.set(
+                        f"greeks:cmdnonce:{nonce}",
+                        "1",
+                        nx=True,
+                        ex=300,
+                    )
+                except Exception as exc:
+                    await self._log(
+                        f"[CMD] nonce store unavailable — fail closed: {exc}"
+                    )
+                    continue
+                if not fresh:
+                    await self._log(f"[CMD] rejected replay nonce={nonce[:10]}…")
+                    continue
+                cmd = str(payload.get("command") or "").strip().lower()
                 if cmd in ("kill", "flatten", "panic"):
                     await self._log(f"[CMD] {cmd}")
                     await self._emergency("operator")
@@ -1420,43 +1831,29 @@ class GreeksEngine:
                     await self._log(f"[CMD] {cmd}")
                     await self._clear_halt()
                     await self._publish()
-                elif cmd in ("sync", "sync_positions", "clear_ghost"):
+                elif cmd == "sync":
                     await self._log(f"[CMD] {cmd}")
-                    if self.cycle.trade and self.client and self.client._auth_ok:
-                        pid = int(self.cycle.trade.product_id or 0)
-                        try:
-                            positions = await self.client.get_positions(product_id=pid or None)
-                            matched = 0
-                            for p in positions or []:
-                                p_pid = int(
-                                    p.get("product_id")
-                                    or (p.get("product") or {}).get("id")
-                                    or 0
-                                )
-                                size = int(_f(p.get("size") or p.get("position_size")))
-                                if pid and p_pid == pid:
-                                    matched = size
-                                    break
-                            if abs(matched) == 0:
-                                await self._clear_external_flat(
-                                    "forced sync — Delta flat"
-                                )
-                            else:
-                                await self._log(
-                                    f"[SYNC] Delta still open size={matched} "
-                                    f"on {self.cycle.trade.symbol}"
-                                )
-                        except Exception as e:
-                            # If sync API fails but user insists clear_ghost
-                            if cmd == "clear_ghost":
-                                await self._clear_external_flat(
-                                    f"forced clear_ghost after sync error: {e}",
-                                    refresh_wallet=True,
-                                )
-                            else:
-                                await self._log(f"[SYNC] cmd failed: {e}")
-                    elif self.cycle.trade and cmd == "clear_ghost":
-                        await self._clear_external_flat("forced clear_ghost")
+                    async with self._state_lock:
+                        local = (
+                            replace(self.cycle.trade)
+                            if self.cycle.trade
+                            else None
+                        )
+                    if local and self.client and self.client._auth_ok:
+                        flat, matched = await self._confirm_delta_flat(
+                            local.product_id,
+                            reads=3,
+                            delay_sec=0.8,
+                        )
+                        if flat:
+                            await self._clear_external_flat(
+                                "signed forced sync — Delta flat confirmed 3x"
+                            )
+                        else:
+                            await self._log(
+                                f"[SYNC] Delta still open size={matched} "
+                                f"on {local.symbol}"
+                            )
                     else:
                         await self._log("[SYNC] no local trade to sync")
                     await self._publish()
@@ -1468,7 +1865,9 @@ class GreeksEngine:
         """Advisory overlay every ~3 minutes. Quant remains authority."""
         while self._running:
             try:
-                t = self.cycle.trade
+                async with self._state_lock:
+                    t = replace(self.cycle.trade) if self.cycle.trade else None
+                    free_quote = self.cycle.free_capital_quote
                 mark = self._mark_cache.get(t.symbol, 0.0) if t else 0.0
                 upnl = 0.0
                 pos = None
@@ -1486,7 +1885,7 @@ class GreeksEngine:
                         "sl": t.sl,
                     }
                 context = {
-                    "free_capital": self.cycle.free_capital_inr,
+                    "free_capital": free_quote,
                     "quant_signal": "HOLD" if t else "SCAN",
                     "position": pos,
                     "upnl": upnl,
@@ -1517,23 +1916,80 @@ class GreeksEngine:
             await asyncio.sleep(180)
 
     async def _emergency(self, reason: str = "operator"):
+        # Block any BUY signal already waiting behind the order mutex.
+        self._entry_blocked = True
+        async with self._order_lock:
+            await self._emergency_serialized(reason)
+
+    async def _emergency_serialized(self, reason: str = "operator"):
         await self.store.set_status("kill_switch", reason)
-        t = self.cycle.trade
-        if t:
+        async with self._state_lock:
+            snapshot = replace(self.cycle.trade) if self.cycle.trade else None
+        execution_confirmed = False
+        if snapshot:
             sig = Signal(
                 action="SELL",
-                symbol=t.symbol,
-                product_id=t.product_id,
-                size=t.size,
-                premium=self._mark_cache.get(t.symbol, t.entry_premium),
-                underlying=t.underlying,
-                option_type=t.option_type,
-                strike=t.strike,
-                contract_value=t.contract_value,
+                symbol=snapshot.symbol,
+                product_id=snapshot.product_id,
+                size=snapshot.size,
+                premium=self._mark_cache.get(
+                    snapshot.symbol, snapshot.entry_premium
+                ),
+                underlying=snapshot.underlying,
+                option_type=snapshot.option_type,
+                strike=snapshot.strike,
+                contract_value=snapshot.contract_value,
                 reason=f"EXIT_EMERGENCY: {reason}",
             )
-            await self._execute(sig)
-        self._running = False
+            execution_confirmed = await self._execute_serialized(sig)
+
+        if not self._live:
+            self._running = False
+            return
+        if not snapshot:
+            # No local option risk to flatten.
+            self._running = False
+            return
+
+        flat, exchange_size = await self._confirm_delta_flat(
+            snapshot.product_id,
+            reads=3,
+            delay_sec=0.8,
+        )
+        if execution_confirmed and flat:
+            async with self._state_lock:
+                trade_remains = bool(self.cycle.trade)
+            if trade_remains:
+                await self._clear_external_flat(
+                    "emergency flatten confirmed by Delta positions"
+                )
+            await self.store.set_status("stopped", f"flat confirmed: {reason}")
+            await self._log(
+                "[EMERGENCY] Delta explicitly confirmed flat — local SoT cleared"
+            )
+            self._running = False
+            return
+
+        # Flatten was rejected, partial, ambiguous, or Delta still reports size.
+        # Keep/restore local risk so sync and exit management remain alive.
+        async with self._state_lock:
+            if not self.cycle.trade:
+                snapshot.size = (
+                    abs(int(exchange_size)) if exchange_size else snapshot.size
+                )
+                self.cycle.trade = snapshot
+            elif exchange_size:
+                self.cycle.trade.size = abs(int(exchange_size))
+            await self.store.save_trade_plan(self.cycle.trade_plan_dict())
+        await self.store.set_status(
+            "flatten_failed",
+            f"{reason}; exchange_size={exchange_size}; "
+            f"execution_confirmed={execution_confirmed}",
+        )
+        await self._log(
+            "[EMERGENCY] flatten NOT confirmed — local SoT retained as active risk; "
+            f"Delta size={exchange_size}"
+        )
 
     async def shutdown(self):
         self._running = False

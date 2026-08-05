@@ -13,6 +13,7 @@ import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 
+import asyncio
 import aiohttp
 
 
@@ -219,6 +220,7 @@ class DeltaClient:
         order_type: str = "market_order",
         limit_price: Optional[str] = None,
         reduce_only: bool = False,
+        client_order_id: Optional[str] = None,
     ) -> Dict:
         body: Dict[str, Any] = {
             "product_id": int(product_id),
@@ -229,8 +231,176 @@ class DeltaClient:
         }
         if limit_price is not None:
             body["limit_price"] = str(limit_price)
+        if client_order_id:
+            # Delta caps this field at 32 characters.
+            body["client_order_id"] = str(client_order_id)[:32]
         data = await self.request("POST", "/v2/orders", body=body, auth=True)
         return data.get("result") or data
+
+    async def get_order(
+        self,
+        order_id: Optional[str] = None,
+        client_order_id: Optional[str] = None,
+    ) -> Optional[Dict]:
+        """Return Delta's latest order object by exchange or client id."""
+        if order_id:
+            path = f"/v2/orders/{order_id}"
+        elif client_order_id:
+            path = f"/v2/orders/client_order_id/{client_order_id}"
+        else:
+            raise ValueError("order_id or client_order_id is required")
+        data = await self.request("GET", path, auth=True)
+        row = data.get("result") if isinstance(data, dict) else None
+        return row if isinstance(row, dict) else None
+
+    async def get_fills(
+        self,
+        product_id: Optional[int] = None,
+        start_time_us: Optional[int] = None,
+        page_size: int = 50,
+    ) -> List[Dict]:
+        """Return recent account fills; caller filters by order_id."""
+        params: Dict[str, Any] = {"page_size": min(max(int(page_size), 1), 50)}
+        if product_id:
+            params["product_ids"] = str(int(product_id))
+        if start_time_us:
+            params["start_time"] = int(start_time_us)
+        data = await self.request("GET", "/v2/fills", params=params, auth=True)
+        rows = data.get("result") if isinstance(data, dict) else []
+        return [r for r in (rows or []) if isinstance(r, dict)]
+
+    @staticmethod
+    def _number(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value) if value not in (None, "") else float(default)
+        except (TypeError, ValueError):
+            return float(default)
+
+    async def resolve_order_fill(
+        self,
+        requested_size: int,
+        product_id: int,
+        order_id: Optional[str] = None,
+        client_order_id: Optional[str] = None,
+        initial: Optional[Dict] = None,
+        timeout_sec: float = 12.0,
+        poll_sec: float = 0.35,
+        started_at_us: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Poll Delta order truth and aggregate its fills.
+
+        Fills are authoritative for executed size/price. Order size minus
+        unfilled_size is the fallback when fill history is briefly delayed.
+        """
+        if not order_id and not client_order_id:
+            raise ValueError("order_id or client_order_id is required")
+        requested = max(0, int(requested_size))
+        started_us = int(started_at_us or (time.time() * 1_000_000) - 5_000_000)
+        deadline = time.monotonic() + max(1.0, float(timeout_sec))
+        latest = dict(initial or {})
+        resolved_order_id = str(order_id or latest.get("id") or "")
+
+        while True:
+            try:
+                row = await self.get_order(
+                    order_id=resolved_order_id or None,
+                    client_order_id=None if resolved_order_id else client_order_id,
+                )
+                if row:
+                    latest = row
+                    resolved_order_id = str(row.get("id") or resolved_order_id)
+            except DeltaAPIError as exc:
+                # Client-id lookup may be briefly unavailable immediately after POST.
+                if exc.status not in (404, 422):
+                    raise
+
+            fills: List[Dict] = []
+            if resolved_order_id:
+                try:
+                    recent = await self.get_fills(
+                        product_id=product_id,
+                        start_time_us=started_us,
+                    )
+                    fills = [
+                        f
+                        for f in recent
+                        if str(f.get("order_id") or "") == resolved_order_id
+                    ]
+                except Exception:
+                    # Order status remains a safe quantity fallback.
+                    fills = []
+
+            fill_size = sum(
+                max(0.0, self._number(f.get("size"))) for f in fills
+            )
+            fill_notional = sum(
+                max(0.0, self._number(f.get("size")))
+                * max(0.0, self._number(f.get("price")))
+                for f in fills
+            )
+            fill_fee = sum(
+                max(0.0, self._number(f.get("commission"))) for f in fills
+            )
+
+            order_size = max(
+                0.0, self._number(latest.get("size"), requested)
+            )
+            unfilled = max(
+                0.0, self._number(latest.get("unfilled_size"), order_size)
+            )
+            order_executed = max(0.0, order_size - unfilled)
+            executed = fill_size if fill_size > 0 else order_executed
+            executed = min(float(requested), executed) if requested else executed
+
+            avg_price = (
+                fill_notional / fill_size
+                if fill_size > 0 and fill_notional > 0
+                else self._number(
+                    latest.get("average_fill_price")
+                    or latest.get("avg_fill_price")
+                    or latest.get("average_price")
+                )
+            )
+            if fill_fee <= 0:
+                fill_fee = max(
+                    0.0,
+                    self._number(
+                        latest.get("paid_commission")
+                        or latest.get("commission")
+                    ),
+                )
+
+            state = str(latest.get("state") or "").lower()
+            terminal = state in ("closed", "cancelled", "rejected")
+            fully_filled = (
+                requested > 0
+                and executed + 1e-12 >= requested
+                and unfilled <= 1e-12
+            )
+            price_confirmed = executed <= 0 or avg_price > 0
+            # A terminal order can reach the order API before its fills reach
+            # /v2/fills. Keep polling rather than inventing a mark-based price.
+            if (
+                (terminal and price_confirmed)
+                or (fully_filled and avg_price > 0)
+                or time.monotonic() >= deadline
+            ):
+                return {
+                    "confirmed": executed > 0 and avg_price > 0,
+                    "filled_size": int(executed),
+                    "avg_price": avg_price,
+                    "fee": fill_fee,
+                    "state": state or "timeout",
+                    "terminal": terminal or fully_filled,
+                    "order_id": resolved_order_id,
+                    "client_order_id": str(
+                        latest.get("client_order_id") or client_order_id or ""
+                    ),
+                    "order": latest,
+                    "fills": fills,
+                }
+            await asyncio.sleep(max(0.1, float(poll_sec)))
 
     async def close_position(self, product_id: int, size: Optional[int] = None) -> Dict:
         """Market reduce-only sell to flatten a long option."""

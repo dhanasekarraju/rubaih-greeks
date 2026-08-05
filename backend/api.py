@@ -20,11 +20,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pathlib import Path
 
+from command_bus import sign_command
+
 load_dotenv()
 
 ROOT = Path(__file__).resolve().parent
 CFG = yaml.safe_load((ROOT / "config.yaml").read_text())
-TOKEN = os.getenv("RUBAIH_GREEKS_API_TOKEN", "").strip()
+TOKEN = (
+    os.getenv("RUBAIH_GREEKS_API_TOKEN")
+    or os.getenv("RUBAIH_API_TOKEN")
+    or ""
+).strip()
 LIVE = os.getenv("LIVE_TRADING", "false").strip().lower() in ("1", "true", "yes")
 
 try:
@@ -75,6 +81,10 @@ async def require_token(
 @app.on_event("startup")
 async def startup():
     global pg_pool, rd
+    if len(TOKEN) < 16:
+        raise RuntimeError(
+            "RUBAIH_GREEKS_API_TOKEN (or RUBAIH_API_TOKEN) must be >=16 chars"
+        )
     pg_pool = await asyncpg.create_pool(
         host=os.getenv("DB_HOST", "postgres"),
         port=int(os.getenv("DB_PORT", "5432")),
@@ -257,11 +267,19 @@ async def get_balance():
         settings = await rd.hgetall("greeks:settings") or {}
     else:
         settings = {}
+    wallet_free = (
+        wallet.get("free_quote")
+        if wallet.get("free_quote") is not None
+        else wallet.get("free_capital")
+    )
+    stored_free = settings.get(
+        "free_capital_quote",
+        settings.get("free_quote", settings.get("free_capital_inr", 0)),
+    )
+    free_quote = float(wallet_free if wallet_free is not None else stored_free or 0)
     return {
-        "free_capital": wallet.get("free_capital")
-        or float(settings.get("free_capital_inr") or 0),
-        "free_quote": wallet.get("free_quote")
-        or float(settings.get("free_quote") or settings.get("free_capital_inr") or 0),
+        "free_capital": free_quote,
+        "free_quote": free_quote,
         "quote_ccy": wallet.get("quote_ccy") or settings.get("quote_ccy") or "USDT",
         "free_inr_approx": wallet.get("free_inr_approx")
         or float(settings.get("free_inr_approx") or 0),
@@ -273,33 +291,36 @@ async def get_balance():
     }
 
 
+async def _queue_command(command: str):
+    if not rd:
+        raise HTTPException(status_code=503, detail="redis unavailable")
+    payload = sign_command(TOKEN, command, source="authenticated_api")
+    await rd.rpush("greeks:commands", json.dumps(payload))
+
+
 @app.post("/api/kill", dependencies=[Depends(require_token)])
 async def kill():
-    if rd:
-        await rd.rpush("greeks:commands", "kill")
+    await _queue_command("kill")
     return {"ok": True, "queued": "kill"}
 
 
 @app.post("/api/refresh-capital", dependencies=[Depends(require_token)])
 async def refresh_capital():
-    if rd:
-        await rd.rpush("greeks:commands", "refresh_capital")
+    await _queue_command("refresh_capital")
     return {"ok": True, "queued": "refresh_capital"}
 
 
 @app.post("/api/resume", dependencies=[Depends(require_token)])
 async def resume():
     """Clear risk halt so the engine may enter again (resets DD baseline)."""
-    if rd:
-        await rd.rpush("greeks:commands", "resume")
+    await _queue_command("resume")
     return {"ok": True, "queued": "resume"}
 
 
 @app.post("/api/sync-positions", dependencies=[Depends(require_token)])
 async def sync_positions():
     """Force Delta↔local open-trade sync (clears ghost if Delta is flat)."""
-    if rd:
-        await rd.rpush("greeks:commands", "sync")
+    await _queue_command("sync")
     return {"ok": True, "queued": "sync"}
 
 

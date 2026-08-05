@@ -51,6 +51,9 @@ risk:
   max_daily_loss_frac: 0.25
   # Consecutive breaching reads needed to halt (filters wallet/mark blips)
   halt_confirm_readings: 2
+  # Never ghost-clear a newly filled option while Delta positions are settling
+  position_settle_grace_sec: 30
+  flat_confirm_readings: 2
   # Halt clears itself after the cooldown — no VPS/manual resume needed
   auto_resume: true
   halt_cooldown_min: 60
