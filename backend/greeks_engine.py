@@ -130,7 +130,9 @@ class OptionsCycle:
         self.free_capital_inr = self.free_capital_quote
         self.margin_use_frac = float(t.get("margin_use_frac", 0.20))
         self.margin_use_max_frac = float(t.get("margin_use_max_frac", 0.25))
-        self.max_premium_budget = float(t.get("max_premium_budget_usdt", 2.0))
+        self.max_premium_budget = float(t.get("max_premium_budget_usdt", 5.0))
+        self.max_open_underlyings = max(1, int(t.get("max_open_underlyings", 2)))
+        self.one_per_underlying = bool(t.get("one_per_underlying", True))
         self.min_interval = float(t.get("min_entry_interval_sec", 120))
         self.entry_cooldown = float(s.get("entry_cooldown_sec", 180))
         self.lookback = int(s.get("momentum_lookback", 20))
@@ -138,7 +140,7 @@ class OptionsCycle:
         self.min_dte = float(s.get("min_dte_days", 1))
         self.max_dte = float(s.get("max_dte_days", 7))
         self.atm_band = float(s.get("atm_band_pct", 0.02))
-        self.max_spread = float(s.get("max_spread_pct", 0.08))
+        self.max_spread = float(s.get("max_spread_pct", 0.03))
         self.min_mark = float(s.get("min_mark_premium", 0.15))
         self.min_delta = float(s.get("min_delta", 0.25))
         self.max_delta = float(s.get("max_delta", 0.60))
@@ -170,9 +172,52 @@ class OptionsCycle:
         self.excluded_pids: Set[int] = set()
         self._spot_hist: Dict[str, List[float]] = {u: [] for u in self.underlyings}
         self._last_signal = 0.0
+        self._last_signal_by_u: Dict[str, float] = {}
         self._last_hold_log = 0.0
         self._last_reject: Dict[str, int] = {}
-        self.trade: Optional[OpenTrade] = None
+        # One live option per underlying (BTC and/or ETH).
+        self.trades: Dict[str, OpenTrade] = {}
+
+    @property
+    def trade(self) -> Optional[OpenTrade]:
+        """Primary open trade (first by underlying name). Prefer open_trades()."""
+        if not self.trades:
+            return None
+        for u in self.underlyings:
+            if u in self.trades:
+                return self.trades[u]
+        return next(iter(self.trades.values()), None)
+
+    def open_trades(self) -> List[OpenTrade]:
+        return list(self.trades.values())
+
+    def trade_for(self, underlying: str) -> Optional[OpenTrade]:
+        return self.trades.get((underlying or "").upper())
+
+    def trade_by_product(self, product_id: int) -> Optional[OpenTrade]:
+        pid = int(product_id or 0)
+        if pid <= 0:
+            return None
+        for t in self.trades.values():
+            if int(t.product_id or 0) == pid:
+                return t
+        return None
+
+    def trade_by_symbol(self, symbol: str) -> Optional[OpenTrade]:
+        sym = str(symbol or "")
+        for t in self.trades.values():
+            if t.symbol == sym:
+                return t
+        return None
+
+    def own_product_ids(self) -> Set[int]:
+        return {int(t.product_id or 0) for t in self.trades.values() if int(t.product_id or 0)}
+
+    def slots_open(self) -> int:
+        return len(self.trades)
+
+    def slots_free(self) -> int:
+        return max(0, self.max_open_underlyings - len(self.trades))
 
     def note_fee_observation(self, fee: float, premium_notional: float):
         """Learn the true taker rate from settled fills.
@@ -204,16 +249,32 @@ class OptionsCycle:
         self.free_capital_inr = value
 
     def budget(self) -> float:
-        # Never fall back from zero quote balance to raw INR configuration.
+        """Largest single-coin budget available right now (SCAN display)."""
+        caps = [self.budget_for(u) for u in self.underlyings]
+        return max(caps) if caps else 0.0
+
+    def budget_for(self, underlying: str) -> float:
+        """Per-coin premium budget. Empty slot → up to max_premium_budget of free."""
+        u = (underlying or "").upper()
+        if not u:
+            return 0.0
+        if self.one_per_underlying and u in self.trades:
+            return 0.0
+        if self.slots_free() <= 0:
+            return 0.0
         free = max(self.free_capital_quote, 0.0)
-        lo = max(0.05, min(self.margin_use_frac, self.margin_use_max_frac))
-        hi = max(lo, min(0.95, self.margin_use_max_frac))
-        use = min(max(self.margin_use_frac, lo), hi)
-        raw = free * use
-        cap = float(self.max_premium_budget or 0)
-        if cap > 0:
-            return min(raw, cap)
-        return raw
+        cap = float(self.max_premium_budget or 0.0)
+        if cap <= 0:
+            return free
+        return min(free, cap)
+
+    def size_contracts(self, unit_cost: float, budget: Optional[float] = None) -> int:
+        """Integer contracts whose premium notional fits budget."""
+        b = self.budget() if budget is None else float(budget)
+        if unit_cost <= 0 or b <= 0:
+            return 0
+        n = int(math.floor(b / unit_cost))
+        return max(0, n)
 
     def note_spot(self, underlying: str, spot: float):
         if spot <= 0:
@@ -301,7 +362,9 @@ class OptionsCycle:
         underlying = str(row.get("underlying_asset_symbol") or "").upper()
         if underlying not in self.underlyings:
             for u in self.underlyings:
-                if f"-{u}-" in symbol.upper() or symbol.upper().startswith(("C-" + u, "P-" + u)):
+                if f"-{u}-" in symbol.upper() or symbol.upper().startswith(
+                    ("C-" + u, "P-" + u)
+                ):
                     underlying = u
                     break
         if underlying not in self.underlyings:
@@ -315,7 +378,6 @@ class OptionsCycle:
         cval = _f(row.get("contract_value") or product.get("contract_value"), 1.0)
         if cval <= 0:
             cval = 1.0
-        # Delta option premium cost ≈ mark * contract_value (quote units)
         unit_cost = mark * cval
         if pid <= 0 or strike <= 0 or mark <= 0 or unit_cost < self.min_mark:
             return None
@@ -372,12 +434,12 @@ class OptionsCycle:
             if moneyness > self.atm_band * 2.5:
                 self._last_reject["atm"] += 1
                 continue
-            # Signed delta → abs band for puts/calls
             abs_delta = abs(c.delta) if c.delta != 0 else 0.0
-            if abs_delta > 0 and (abs_delta < self.min_delta or abs_delta > self.max_delta):
+            if abs_delta > 0 and (
+                abs_delta < self.min_delta or abs_delta > self.max_delta
+            ):
                 self._last_reject["delta"] += 1
                 continue
-            # If exchange omits delta, still allow near-ATM (moneyness already gated)
             mom = self.momentum(c.underlying)
             if abs(mom) < self.entry_move_pct:
                 self._last_reject["mom"] += 1
@@ -388,17 +450,12 @@ class OptionsCycle:
             if mom <= -self.entry_move_pct and c.option_type != "put":
                 self._last_reject["side"] += 1
                 continue
-            # Expectancy gate. Premium responds to spot by delta, so the move
-            # already in hand is worth delta * spot_move, expressed as a share
-            # of the premium being paid. Unless that clears the round trip's
-            # spread and fees by a margin, the trade is a losing coin flip.
             c.friction_pct = self.round_trip_friction(c.spread_pct)
             eff_delta = abs(c.delta) if c.delta != 0 else self.target_delta
             c.edge_pct = eff_delta * abs(mom) * c.spot / max(c.mark, 1e-9)
             if c.edge_pct < c.friction_pct * self.min_edge_multiple:
                 self._last_reject["edge"] += 1
                 continue
-            # Prefer mid-delta ~target, tight spread, DTE ~3d, closer ATM
             atm_score = 1.0 / (1e-6 + moneyness)
             spread_score = 1.0 / (1e-6 + c.spread_pct)
             dte_score = 1.0 - abs((c.dte_days - 3.0) / max(self.max_dte, 1))
@@ -419,19 +476,15 @@ class OptionsCycle:
         ranked.sort(key=lambda x: x.score, reverse=True)
         return ranked
 
-    def size_contracts(self, unit_cost: float) -> int:
-        """Integer contracts whose premium notional fits budget."""
-        budget = self.budget()
-        if unit_cost <= 0 or budget <= 0:
-            return 0
-        # unit_cost is approx quote/INR-equivalent cost of 1 contract
-        n = int(math.floor(budget / unit_cost))
-        return max(0, n)
-
     def pick_entry(self, tickers: List[Dict]) -> Optional[Signal]:
+        sigs = self.pick_entries(tickers)
+        return sigs[0] if sigs else None
+
+    def pick_entries(self, tickers: List[Dict]) -> List[Signal]:
+        """Up to one new entry per free underlying when each clears the gates."""
         now = time.time()
-        if self.trade:
-            return None
+        if self.slots_free() <= 0:
+            return []
         cands = []
         spots = {}
         for row in tickers:
@@ -439,58 +492,63 @@ class OptionsCycle:
             if c:
                 spots[c.underlying] = c.spot
                 cands.append(c)
-        # One spot sample per underlying per scan (avoid drowning momentum history)
         for u, spot in spots.items():
             self.note_spot(u, spot)
         ranked = self.filter_rank(cands)
-        if now - self._last_signal < max(self.min_interval, self.entry_cooldown):
-            return None
         if not ranked:
-            return None
-        # Prefer contracts that fit budget (cheap ATM lots often unit≪1 USDT)
-        budget = self.budget()
-        fit = []
+            return []
+
+        cooldown = max(self.min_interval, self.entry_cooldown)
+        open_us = set(self.trades.keys())
+        signals: List[Signal] = []
+        taken_us: Set[str] = set()
+        # Walk score order; take at most one contract per free underlying.
         for c in ranked:
+            if len(signals) >= self.slots_free():
+                break
+            u = c.underlying.upper()
+            if u in open_us or u in taken_us:
+                continue
+            if self.one_per_underlying and u in self.trades:
+                continue
+            last_u = self._last_signal_by_u.get(u, 0.0)
+            if now - last_u < cooldown:
+                continue
+            budget = self.budget_for(u)
+            if budget <= 0:
+                continue
             px = c.ask if c.ask > 0 else c.mark
-            uc = px * c.contract_value
-            if uc > 0 and uc <= budget * 1.01:
-                fit.append((c, px, uc))
-        if not fit:
-            best = ranked[0]
-            px = best.ask if best.ask > 0 else best.mark
-            unit_cost = px * best.contract_value
-            print(
-                f"[SCAN] skip size: best={best.symbol} unit_cost≈{unit_cost:.4f} "
-                f"budget={budget:.4f} ranked={len(ranked)}"
+            unit_cost = px * c.contract_value
+            if unit_cost <= 0 or unit_cost > budget * 1.01:
+                continue
+            size = self.size_contracts(unit_cost, budget)
+            if size < 1:
+                continue
+            mom = self.momentum(u)
+            signals.append(
+                Signal(
+                    action="BUY",
+                    symbol=c.symbol,
+                    product_id=c.product_id,
+                    size=size,
+                    premium=px,
+                    underlying=u,
+                    option_type=c.option_type,
+                    strike=c.strike,
+                    contract_value=c.contract_value,
+                    reason=(
+                        f"ENTRY_{c.option_type.upper()}: {c.symbol} mom={mom:+.2%} "
+                        f"spot={c.spot:.2f} K={c.strike:.2f} dte={c.dte_days:.1f}d "
+                        f"delta={c.delta:+.2f} mark={px:.4f} unit≈{unit_cost:.4f} "
+                        f"size={size} budget={budget:.4f} "
+                        f"TP=+{self.tp_pct:.0%} SL=-{self.sl_pct:.0%}"
+                    ),
+                )
             )
-            return None
-        best, px, unit_cost = fit[0]
-        size = self.size_contracts(unit_cost)
-        if size < 1:
-            print(
-                f"[SCAN] skip size: best={best.symbol} unit_cost≈{unit_cost:.4f} "
-                f"budget={budget:.4f}"
-            )
-            return None
-        self._last_signal = now
-        mom = self.momentum(best.underlying)
-        return Signal(
-            action="BUY",
-            symbol=best.symbol,
-            product_id=best.product_id,
-            size=size,
-            premium=px,
-            underlying=best.underlying,
-            option_type=best.option_type,
-            strike=best.strike,
-            contract_value=best.contract_value,
-            reason=(
-                f"ENTRY_{best.option_type.upper()}: {best.symbol} mom={mom:+.2%} "
-                f"spot={best.spot:.2f} K={best.strike:.2f} dte={best.dte_days:.1f}d "
-                f"delta={best.delta:+.2f} mark={px:.4f} unit≈{unit_cost:.4f} size={size} "
-                f"budget={budget:.4f} TP=+{self.tp_pct:.0%} SL=-{self.sl_pct:.0%}"
-            ),
-        )
+            taken_us.add(u)
+            self._last_signal_by_u[u] = now
+            self._last_signal = now
+        return signals
 
     def arm(self, sig: Signal, fill_premium: Optional[float] = None):
         entry = float(fill_premium or sig.premium)
@@ -499,10 +557,15 @@ class OptionsCycle:
         sl = entry * (1.0 - self.sl_pct)
         r = abs(entry - sl) * sig.size * cval
         cost = entry * sig.size * cval
-        self.trade = OpenTrade(
+        u = (sig.underlying or "").upper()
+        if not u:
+            # Fall back to symbol parse C-BTC-... / P-ETH-...
+            parts = (sig.symbol or "").split("-")
+            u = parts[1].upper() if len(parts) >= 2 else "UNK"
+        trade = OpenTrade(
             symbol=sig.symbol,
             product_id=sig.product_id,
-            underlying=sig.underlying,
+            underlying=u,
             option_type=sig.option_type,
             strike=sig.strike,
             size=sig.size,
@@ -516,19 +579,26 @@ class OptionsCycle:
             peak_pnl=0.0,
             peak_premium=entry,
         )
+        self.trades[u] = trade
         print(
             f"[PLAN] {sig.symbol} entry={entry:.4f} size={sig.size} cval={cval} "
             f"cost={cost:.4f} | TP=+{self.tp_pct:.0%}→{tp:.4f} "
-            f"SL=-{self.sl_pct:.0%}→{sl:.4f} | 1R={r:.4f} trail={self.trail_arm_r}R"
+            f"SL=-{self.sl_pct:.0%}→{sl:.4f} | 1R={r:.4f} trail={self.trail_arm_r}R "
+            f"| slots={self.slots_open()}/{self.max_open_underlyings}"
         )
 
-    def clear(self):
-        self.trade = None
+    def clear(self, underlying: Optional[str] = None, symbol: Optional[str] = None):
+        if symbol:
+            t = self.trade_by_symbol(symbol)
+            if t:
+                self.trades.pop(t.underlying.upper(), None)
+            return
+        if underlying:
+            self.trades.pop(underlying.upper(), None)
+            return
+        self.trades.clear()
 
-    def trade_plan_dict(self) -> Dict:
-        t = self.trade
-        if not t:
-            return {}
+    def _trade_to_dict(self, t: OpenTrade) -> Dict:
         return {
             "symbol": t.symbol,
             "product_id": t.product_id,
@@ -547,10 +617,22 @@ class OptionsCycle:
             "peak_premium": t.peak_premium,
         }
 
-    def restore(self, data: Dict):
+    def trade_plan_dict(self) -> Dict:
+        rows = [self._trade_to_dict(t) for t in self.open_trades()]
+        if not rows:
+            return {}
+        # v2 multi-slot + legacy single-trade keys for older API/mobile readers
+        primary = rows[0]
+        return {
+            "version": 2,
+            "trades": rows,
+            **primary,
+        }
+
+    def _restore_one(self, data: Dict) -> Optional[OpenTrade]:
         if not data or not data.get("symbol"):
-            return
-        self.trade = OpenTrade(
+            return None
+        return OpenTrade(
             symbol=str(data["symbol"]),
             product_id=int(data.get("product_id") or 0),
             underlying=str(data.get("underlying") or ""),
@@ -568,8 +650,26 @@ class OptionsCycle:
             peak_premium=_f(data.get("peak_premium") or data.get("entry_premium")),
         )
 
-    def evaluate_exit(self, mark: float) -> Optional[Signal]:
-        t = self.trade
+    def restore(self, data: Dict):
+        self.trades = {}
+        if not data:
+            return
+        rows = data.get("trades")
+        if isinstance(rows, list) and rows:
+            for row in rows:
+                t = self._restore_one(row if isinstance(row, dict) else {})
+                if t and t.underlying:
+                    self.trades[t.underlying.upper()] = t
+            return
+        # Legacy single-trade plan
+        t = self._restore_one(data)
+        if t and t.underlying:
+            self.trades[t.underlying.upper()] = t
+        elif t:
+            self.trades["UNK"] = t
+
+    def evaluate_exit(self, mark: float, trade: Optional[OpenTrade] = None) -> Optional[Signal]:
+        t = trade if trade is not None else self.trade
         if not t or mark <= 0:
             return None
         cval = float(t.contract_value or 1.0)
@@ -588,15 +688,18 @@ class OptionsCycle:
         if now - self._last_hold_log > 8:
             self._last_hold_log = now
             held = now - t.entry_ts
+            open_n = self.slots_open()
             print(
                 f"[HOLD] {t.symbol} mark={mark:.4f} pnl={pnl:.2f} peak={t.peak_pnl:.2f} "
                 f"giveback={giveback:.2f}/{giveback_need:.2f} TP={t.tp:.4f} SL={t.sl:.4f} "
                 f"maxloss={max_loss:.2f} held={held:.0f}s/{self.max_hold_sec:.0f}s "
-                f"trail={'ON' if t.peak_pnl >= arm else 'off'}"
+                f"trail={'ON' if t.peak_pnl >= arm else 'off'} "
+                f"slots={open_n}/{self.max_open_underlyings}"
             )
 
         def _sell(reason: str) -> Signal:
             self._last_signal = now
+            self._last_signal_by_u[t.underlying.upper()] = now
             return Signal(
                 action="SELL",
                 symbol=t.symbol,
@@ -885,6 +988,7 @@ class GreeksEngine:
             10.0, float(risk_cfg.get("position_settle_grace_sec", 30))
         )
         self._flat_confirm_count = 0
+        self._flat_confirm_by_pid: Dict[int, int] = {}
         self._flat_confirms_needed = max(
             2, int(risk_cfg.get("flat_confirm_readings", 2))
         )
@@ -934,7 +1038,9 @@ class GreeksEngine:
         await self._log(f" AI: {'ENABLED (OpenRouter→NVIDIA)' if self._ai_enabled else 'DISABLED'}")
         await self._log(
             f" Free: {self.cycle.free_capital_inr:.4f} {self._quote_ccy} "
-            f"budget={self.cycle.budget():.4f} cap={self.cycle.max_premium_budget:.2f}"
+            f"budget={self.cycle.max_premium_budget:.2f}/coin "
+            f"slots=0/{self.cycle.max_open_underlyings} "
+            f"(one per underlying)"
         )
         await self._log(
             f" Filters: DTE {self.cycle.min_dte:.0f}-{self.cycle.max_dte:.0f}d "
@@ -1112,7 +1218,7 @@ class GreeksEngine:
         # Operator retuned bot_allocation_quote (deposit / withdrawal). Adopt it
         # when flat so Redis doesn't keep the old probe-sized base forever.
         declared = self.cycle.bot_allocation
-        if declared > 0 and not self.cycle.trade:
+        if declared > 0 and not self.cycle.open_trades():
             old = self._bot_base
             if old <= 0 or abs(declared - old) / max(old, 1e-9) > 0.02:
                 self._bot_base = declared
@@ -1144,12 +1250,14 @@ class GreeksEngine:
         )
 
     def _position_value(self) -> float:
-        """Market value of the open option (quote ccy) so equity isn't dented by entries."""
-        t = self.cycle.trade
-        if not t or t.size <= 0:
-            return 0.0
-        mark = self._mark_cache.get(t.symbol, 0.0) or t.entry_premium
-        return max(0.0, mark * t.size * float(t.contract_value or 1.0))
+        """Market value of open options (quote ccy)."""
+        total = 0.0
+        for t in self.cycle.open_trades():
+            if t.size <= 0:
+                continue
+            mark = self._mark_cache.get(t.symbol, 0.0) or t.entry_premium
+            total += max(0.0, mark * t.size * float(t.contract_value or 1.0))
+        return total
 
     def _bot_equity(self) -> float:
         """The bot's own equity curve, independent of the wallet.
@@ -1162,11 +1270,14 @@ class GreeksEngine:
         return self._bot_base + self._bot_realized + self._unrealized()
 
     def _unrealized(self) -> float:
-        t = self.cycle.trade
-        if not t or t.size <= 0:
-            return 0.0
-        mark = self._mark_cache.get(t.symbol, 0.0) or t.entry_premium
-        return (mark - t.entry_premium) * t.size * float(t.contract_value or 1.0)
+        total = 0.0
+        for t in self.cycle.open_trades():
+            if t.size <= 0:
+                continue
+            mark = self._mark_cache.get(t.symbol, 0.0) or t.entry_premium
+            total += (mark - t.entry_premium) * t.size * float(t.contract_value or 1.0)
+        return total
+
 
     def _seed_bot_base(self, free: float) -> float:
         declared = self.cycle.bot_allocation
@@ -1287,8 +1398,8 @@ class GreeksEngine:
         await self._log(f"[HALT] {reason} — flatten open trade; block entries ({cooldown})")
         async with self._order_lock:
             async with self._state_lock:
-                t = replace(self.cycle.trade) if self.cycle.trade else None
-            if t:
+                open_rows = [replace(t) for t in self.cycle.open_trades()]
+            for t in open_rows:
                 mark = self._mark_cache.get(t.symbol, t.entry_premium)
                 sig = Signal(
                     action="SELL",
@@ -1369,27 +1480,57 @@ class GreeksEngine:
 
     async def _publish(self):
         async with self._state_lock:
-            t = replace(self.cycle.trade) if self.cycle.trade else None
+            open_rows = [replace(t) for t in self.cycle.open_trades()]
             free = float(self.cycle.free_capital_quote)
             budget = self.cycle.budget()
-        mark = self._mark_cache.get(t.symbol, 0.0) if t else 0.0
-        upnl = ((mark - t.entry_premium) * t.size * float(t.contract_value or 1.0)) if t and mark > 0 else 0.0
+            slots = f"{self.cycle.slots_open()}/{self.cycle.max_open_underlyings}"
+        positions = []
+        upnl_all = 0.0
+        for t in open_rows:
+            mark = self._mark_cache.get(t.symbol, 0.0)
+            upnl = (
+                (mark - t.entry_premium) * t.size * float(t.contract_value or 1.0)
+                if mark > 0
+                else 0.0
+            )
+            upnl_all += upnl
+            positions.append(
+                {
+                    "symbol": t.symbol,
+                    "size": t.size,
+                    "entry": t.entry_premium,
+                    "mark": mark,
+                    "upnl": upnl,
+                    "tp": t.tp,
+                    "sl": t.sl,
+                    "underlying": t.underlying,
+                    "option_type": t.option_type,
+                    "strike": t.strike,
+                    "delta": self._delta_cache.get(t.symbol),
+                }
+            )
+        t = open_rows[0] if open_rows else None
+        mark = positions[0]["mark"] if positions else 0.0
+        upnl = positions[0]["upnl"] if positions else 0.0
         ccy = getattr(self, "_quote_ccy", "USDT") or "USDT"
         inr_approx = free * float(self.cycle.usdt_inr) if ccy in ("USDT", "USD", "USDC") else free
         snap = {
             "ts": time.time(),
             "mode": "options_cycle",
             "live": self._live,
-            "free_capital_inr": free,  # legacy: quote units used for sizing
+            "free_capital_inr": free,
             "free_capital_quote": free,
             "free_quote": free,
             "quote_ccy": ccy,
             "free_inr_approx": inr_approx,
             "usdt_inr": self.cycle.usdt_inr,
-            "budget_inr": budget,  # legacy quote-unit alias
+            "budget_inr": budget,
             "budget_quote": budget,
+            "budget_per_coin": self.cycle.max_premium_budget,
+            "open_slots": slots,
+            "max_open_underlyings": self.cycle.max_open_underlyings,
             "capital_source": self._capital_source,
-            "session_pnl": self._session_pnl + upnl,
+            "session_pnl": self._session_pnl + upnl_all,
             "halted": self._halted,
             "halt_reason": self._halt_reason,
             "drawdown_pct": self._drawdown_pct,
@@ -1398,7 +1539,7 @@ class GreeksEngine:
             "bot_base": self._bot_base,
             "bot_realized": self._bot_realized,
             "bot_equity": self._bot_equity(),
-            "peak_free": self._peak_equity,  # legacy key, now the bot's peak
+            "peak_free": self._peak_equity,
             "peak_equity": self._peak_equity,
             "day_start_free": self._day_start_equity,
             "day_start_equity": self._day_start_equity,
@@ -1420,40 +1561,42 @@ class GreeksEngine:
             "ai_last_action": (self._ai_last or {}).get("action"),
             "ai_confidence": (self._ai_last or {}).get("confidence"),
             "ai_emergency_conf": 0.95,
-            "position": None
-            if not t
-            else {
-                "symbol": t.symbol,
-                "size": t.size,
-                "entry": t.entry_premium,
-                "mark": mark,
-                "upnl": upnl,
-                "tp": t.tp,
-                "sl": t.sl,
-                "underlying": t.underlying,
-                "option_type": t.option_type,
-                "strike": t.strike,
-                "delta": self._delta_cache.get(t.symbol),
-            },
+            "position": positions[0] if positions else None,
+            "positions": positions,
             "tp_display": f"Premium +{self.cycle.tp_pct*100:.0f}%",
             "sl_display": f"Premium −{self.cycle.sl_pct*100:.0f}%",
             "max_hold_sec": self.cycle.max_hold_sec,
         }
         await self.store.publish_dashboard(snap)
 
-    async def _clear_external_flat(self, reason: str, refresh_wallet: bool = True):
+    async def _clear_external_flat(
+        self,
+        reason: str,
+        refresh_wallet: bool = True,
+        product_id: int = 0,
+        symbol: str = "",
+    ):
         """Delta already flat (manual close / reduce_only empty) — drop local ghost."""
         async with self._state_lock:
-            t = self.cycle.trade
-            sym = t.symbol if t else "?"
-            # The position left the book at an unknown price; crystallise it at
-            # the last mark so the equity curve stays continuous.
-            self._bot_realized += self._unrealized()
-            self.cycle.clear()
+            if product_id:
+                t = self.cycle.trade_by_product(int(product_id))
+            elif symbol:
+                t = self.cycle.trade_by_symbol(symbol)
+            else:
+                t = self.cycle.trade
+            if not t:
+                return
+            mark = self._mark_cache.get(t.symbol, 0.0) or t.entry_premium
+            self._bot_realized += (
+                (mark - t.entry_premium) * t.size * float(t.contract_value or 1.0)
+            )
+            sym = t.symbol
+            self.cycle.clear(underlying=t.underlying)
             self._last_flatten_ts = time.time()
             self._last_fill_ts = 0.0
             self._flat_confirm_count = 0
-            await self.store.save_trade_plan({})
+            plan = self.cycle.trade_plan_dict()
+            await self.store.save_trade_plan(plan if plan else {})
             if not refresh_wallet:
                 await self.store.save_capital(
                     self.cycle.free_capital_quote,
@@ -1548,14 +1691,14 @@ class GreeksEngine:
             await self._log(f"[GUARD] manual position scan failed: {exc}")
             return
         async with self._state_lock:
-            own = int(self.cycle.trade.product_id or 0) if self.cycle.trade else 0
+            own = self.cycle.own_product_ids()
         foreign: Set[int] = set()
         for row in positions or []:
             pid = int(
                 row.get("product_id") or (row.get("product") or {}).get("id") or 0
             )
             size = int(_f(row.get("size") or row.get("position_size")))
-            if pid and abs(size) > 0 and pid != own:
+            if pid and abs(size) > 0 and pid not in own:
                 foreign.add(pid)
         appeared = foreign - self._foreign_pids
         if appeared:
@@ -1665,7 +1808,8 @@ class GreeksEngine:
                     flat, _ = await self._confirm_delta_flat(sig.product_id)
                     if flat:
                         await self._clear_external_flat(
-                            "Delta flat confirmed after no_position_for_reduce_only"
+                            "Delta flat confirmed after no_position_for_reduce_only",
+                            product_id=sig.product_id,
                         )
                         await self._finish_order_claim(
                             sig,
@@ -1765,6 +1909,15 @@ class GreeksEngine:
             executed_sig = replace(sig, size=filled_size, premium=fill_px)
             await self.store.save_trade(executed_sig)
             if sig.action == "BUY":
+                u = (sig.underlying or "").upper()
+                if self.cycle.one_per_underlying and u and u in self.cycle.trades:
+                    await self._log(
+                        f"[ORDER] BUY blocked — already holding {u} slot"
+                    )
+                    return False, False, False
+                if self.cycle.slots_free() <= 0:
+                    await self._log("[ORDER] BUY blocked — no free underlying slots")
+                    return False, False, False
                 cval = float(sig.contract_value or 1.0)
                 cost = fill_px * filled_size * cval
                 fee = (
@@ -1791,7 +1944,11 @@ class GreeksEngine:
                 self._flat_confirm_count = 0
                 return True, False, False
 
-            t = self.cycle.trade
+            t = (
+                self.cycle.trade_by_product(sig.product_id)
+                or self.cycle.trade_by_symbol(sig.symbol)
+                or self.cycle.trade
+            )
             if not t:
                 await self._log(
                     "[ORDER] confirmed SELL but no local trade; "
@@ -1817,10 +1974,11 @@ class GreeksEngine:
             )
             remaining = original_size - closed_size
             if remaining <= 0:
-                self.cycle.clear()
+                self.cycle.clear(underlying=t.underlying)
                 self._last_flatten_ts = time.time()
                 self._flat_confirm_count = 0
-                await self.store.save_trade_plan({})
+                plan = self.cycle.trade_plan_dict()
+                await self.store.save_trade_plan(plan if plan else {})
             else:
                 t.size = remaining
                 t.premium_budget = max(0.0, t.premium_budget - release)
@@ -1840,7 +1998,8 @@ class GreeksEngine:
             await self._log(
                 f"[{'FLAT' if remaining <= 0 else 'PARTIAL'}] "
                 f"closed={closed_size} pnl≈{pnl:.4f} "
-                f"free={self.cycle.free_capital_quote:.4f} USDT"
+                f"free={self.cycle.free_capital_quote:.4f} USDT "
+                f"slots={self.cycle.slots_open()}/{self.cycle.max_open_underlyings}"
             )
             return True, remaining <= 0, True
 
@@ -1853,15 +2012,18 @@ class GreeksEngine:
                 if time.time() - self._last_capital_refresh > 60:
                     await self._refresh_capital(force=False)
                 tickers = await self.client.get_option_tickers(self.cycle.underlyings)
-                # refresh marks for open trade
+                # Manage every open slot: mark refresh + exit, independently.
                 async with self._state_lock:
-                    active_trade = replace(self.cycle.trade) if self.cycle.trade else None
-                if active_trade:
+                    active_trades = [replace(t) for t in self.cycle.open_trades()]
+                for active_trade in active_trades:
                     sym = active_trade.symbol
                     try:
                         tk = await self.client.get_ticker(sym)
                         if tk:
-                            mark = _f(tk.get("mark_price") or (tk.get("quotes") or {}).get("mark_price"))
+                            mark = _f(
+                                tk.get("mark_price")
+                                or (tk.get("quotes") or {}).get("mark_price")
+                            )
                             if mark > 0:
                                 self._mark_cache[sym] = mark
                             g = tk.get("greeks") or {}
@@ -1870,11 +2032,13 @@ class GreeksEngine:
                                 self._delta_cache[sym] = dlt
                             async with self._state_lock:
                                 exit_sig = None
-                                if self.cycle.trade and self.cycle.trade.symbol == sym:
+                                live = self.cycle.trade_by_symbol(sym)
+                                if live:
                                     exit_sig = self.cycle.evaluate_exit(
                                         mark
                                         if mark > 0
-                                        else self._mark_cache.get(sym, 0)
+                                        else self._mark_cache.get(sym, 0),
+                                        trade=live,
                                     )
                                     await self.store.save_trade_plan(
                                         self.cycle.trade_plan_dict()
@@ -1883,7 +2047,9 @@ class GreeksEngine:
                                 await self._execute(exit_sig)
                     except Exception as e:
                         await self._log(f"[MARK] {sym}: {e}")
-                elif self._halted and not await self._maybe_auto_resume():
+
+                # Entries fill free underlying slots (BTC and/or ETH).
+                if self._halted and not await self._maybe_auto_resume():
                     if int(time.time()) % 90 < 3:
                         left = max(
                             0.0,
@@ -1900,19 +2066,21 @@ class GreeksEngine:
                 elif self._risk_block:
                     if int(time.time()) % 90 < 3:
                         await self._log(f"[RISK] entries blocked — {self._risk_block}")
-                else:
+                elif self.cycle.slots_free() > 0:
                     async with self._state_lock:
-                        entry = self.cycle.pick_entry(tickers or [])
-                    if entry:
+                        entries = self.cycle.pick_entries(tickers or [])
+                    for entry in entries:
                         await self._execute(entry)
-                    elif int(time.time()) % 60 < 3:
+                    if not entries and int(time.time()) % 60 < 3:
                         rej = getattr(self.cycle, "_last_reject", {}) or {}
                         mom_btc = self.cycle.momentum("BTC")
                         mom_eth = self.cycle.momentum("ETH")
                         await self._log(
                             f"[SCAN] tickers={len(tickers or [])} "
                             f"free={self.cycle.free_capital_quote:.4f} "
-                            f"budget={self.cycle.budget():.4f} "
+                            f"budget={self.cycle.budget():.4f}/coin "
+                            f"slots={self.cycle.slots_open()}/"
+                            f"{self.cycle.max_open_underlyings} "
                             f"pass={rej.get('pass', 0)} "
                             f"rej dte={rej.get('dte', 0)} spr={rej.get('spread', 0)} "
                             f"atm={rej.get('atm', 0)} δ={rej.get('delta', 0)} "
@@ -1934,8 +2102,8 @@ class GreeksEngine:
         emergency flatten sell contracts it never bought.
         """
         async with self._state_lock:
-            t = self.cycle.trade
-            if not t or int(t.product_id or 0) != pid:
+            t = self.cycle.trade_by_product(pid)
+            if not t:
                 return
             local_size = abs(int(t.size or 0))
             if exchange_size == local_size:
@@ -1947,8 +2115,6 @@ class GreeksEngine:
                 )
                 return
             scale = exchange_size / local_size if local_size else 0.0
-            # Partially closed by hand: book the difference so the equity curve
-            # does not carry contracts that no longer exist.
             mark = self._mark_cache.get(t.symbol, 0.0) or t.entry_premium
             gone = local_size - exchange_size
             self._bot_realized += (
@@ -1964,7 +2130,7 @@ class GreeksEngine:
             )
 
     async def sync_loop(self):
-        """Keep local open trade aligned with Delta (manual open/close)."""
+        """Keep local open trades aligned with Delta (manual open/close)."""
         while self._running:
             try:
                 if not (self.client and self.client._auth_ok):
@@ -1973,18 +2139,16 @@ class GreeksEngine:
 
                 await self._scan_foreign_positions()
 
-                # Snapshot local SoT; all later mutations re-check under lock.
                 async with self._state_lock:
-                    local_trade = (
-                        replace(self.cycle.trade) if self.cycle.trade else None
-                    )
-                if local_trade:
+                    locals_ = [replace(t) for t in self.cycle.open_trades()]
+                for local_trade in locals_:
                     pid = int(local_trade.product_id or 0)
                     try:
-                        positions = await self.client.get_positions(product_id=pid or None)
+                        positions = await self.client.get_positions(
+                            product_id=pid or None
+                        )
                     except Exception as e:
                         await self._log(f"[SYNC] positions: {e}")
-                        await asyncio.sleep(8)
                         continue
 
                     matched_size = 0
@@ -2012,39 +2176,35 @@ class GreeksEngine:
                             else time.time() - self._last_fill_ts
                         )
                         async with self._state_lock:
-                            same_trade = (
-                                self.cycle.trade
-                                and int(self.cycle.trade.product_id or 0) == pid
-                            )
+                            same_trade = bool(self.cycle.trade_by_product(pid))
                             if not same_trade:
-                                self._flat_confirm_count = 0
+                                self._flat_confirm_by_pid[pid] = 0
                             elif age < self._settle_grace_sec:
-                                self._flat_confirm_count = 0
+                                self._flat_confirm_by_pid[pid] = 0
                                 await self._log(
                                     f"[SYNC] defer flat {local_trade.symbol} — "
                                     f"settle grace {age:.0f}/{self._settle_grace_sec:.0f}s"
                                 )
                             else:
-                                self._flat_confirm_count += 1
-                                should_clear = (
-                                    self._flat_confirm_count
-                                    >= self._flat_confirms_needed
-                                )
+                                n = self._flat_confirm_by_pid.get(pid, 0) + 1
+                                self._flat_confirm_by_pid[pid] = n
+                                should_clear = n >= self._flat_confirms_needed
                                 if not should_clear:
                                     await self._log(
-                                        f"[SYNC] flat confirm "
-                                        f"{self._flat_confirm_count}/"
+                                        f"[SYNC] flat confirm {n}/"
                                         f"{self._flat_confirms_needed} "
                                         f"for {local_trade.symbol}"
                                     )
                     else:
                         async with self._state_lock:
-                            self._flat_confirm_count = 0
+                            self._flat_confirm_by_pid[pid] = 0
 
                     if should_clear:
+                        self._flat_confirm_by_pid[pid] = 0
                         await self._clear_external_flat(
                             f"Delta flat confirmed {self._flat_confirms_needed}x "
-                            f"after {self._settle_grace_sec:.0f}s settle grace"
+                            f"after {self._settle_grace_sec:.0f}s settle grace",
+                            product_id=pid,
                         )
                     elif abs(matched_size) > 0:
                         await self._reconcile_size(pid, abs(int(matched_size)))
@@ -2099,28 +2259,26 @@ class GreeksEngine:
                 elif cmd == "sync":
                     await self._log(f"[CMD] {cmd}")
                     async with self._state_lock:
-                        local = (
-                            replace(self.cycle.trade)
-                            if self.cycle.trade
-                            else None
-                        )
-                    if local and self.client and self.client._auth_ok:
-                        flat, matched = await self._confirm_delta_flat(
-                            local.product_id,
-                            reads=3,
-                            delay_sec=0.8,
-                        )
-                        if flat:
-                            await self._clear_external_flat(
-                                "signed forced sync — Delta flat confirmed 3x"
-                            )
-                        else:
-                            await self._log(
-                                f"[SYNC] Delta still open size={matched} "
-                                f"on {local.symbol}"
-                            )
-                    else:
+                        locals_ = [replace(t) for t in self.cycle.open_trades()]
+                    if not locals_:
                         await self._log("[SYNC] no local trade to sync")
+                    elif self.client and self.client._auth_ok:
+                        for local in locals_:
+                            flat, matched = await self._confirm_delta_flat(
+                                local.product_id,
+                                reads=3,
+                                delay_sec=0.8,
+                            )
+                            if flat:
+                                await self._clear_external_flat(
+                                    "signed forced sync — Delta flat confirmed 3x",
+                                    product_id=local.product_id,
+                                )
+                            else:
+                                await self._log(
+                                    f"[SYNC] Delta still open size={matched} "
+                                    f"on {local.symbol}"
+                                )
                     await self._publish()
             except Exception as e:
                 await self._log(f"[CMD] {e}")
@@ -2131,31 +2289,45 @@ class GreeksEngine:
         while self._running:
             try:
                 async with self._state_lock:
-                    t = replace(self.cycle.trade) if self.cycle.trade else None
+                    rows = [replace(t) for t in self.cycle.open_trades()]
                     free_quote = self.cycle.free_capital_quote
-                mark = self._mark_cache.get(t.symbol, 0.0) if t else 0.0
-                upnl = 0.0
-                pos = None
-                if t and mark > 0:
-                    upnl = (mark - t.entry_premium) * t.size * float(t.contract_value or 1.0)
-                    pos = {
-                        "symbol": t.symbol,
-                        "side": "long",
-                        "option_type": t.option_type,
-                        "strike": t.strike,
-                        "size": t.size,
-                        "entry": t.entry_premium,
-                        "mark": mark,
-                        "tp": t.tp,
-                        "sl": t.sl,
-                    }
+                positions = []
+                upnl_all = 0.0
+                for t in rows:
+                    mark = self._mark_cache.get(t.symbol, 0.0)
+                    upnl = (
+                        (mark - t.entry_premium)
+                        * t.size
+                        * float(t.contract_value or 1.0)
+                        if mark > 0
+                        else 0.0
+                    )
+                    upnl_all += upnl
+                    positions.append(
+                        {
+                            "symbol": t.symbol,
+                            "side": "long",
+                            "option_type": t.option_type,
+                            "strike": t.strike,
+                            "size": t.size,
+                            "entry": t.entry_premium,
+                            "mark": mark,
+                            "tp": t.tp,
+                            "sl": t.sl,
+                            "underlying": t.underlying,
+                        }
+                    )
                 context = {
                     "free_capital": free_quote,
-                    "quant_signal": "HOLD" if t else "SCAN",
-                    "position": pos,
-                    "upnl": upnl,
+                    "quant_signal": "HOLD" if positions else "SCAN",
+                    "position": positions[0] if positions else None,
+                    "positions": positions,
+                    "upnl": upnl_all,
                     "underlyings": self.cycle.underlyings,
-                    "notes": "buy-side options cycle; no premium selling",
+                    "notes": (
+                        "buy-side options cycle; up to one live option per "
+                        "underlying (BTC+ETH); no premium selling"
+                    ),
                 }
                 decision = await self.ai.analyze(context)
                 if decision:
@@ -2189,9 +2361,16 @@ class GreeksEngine:
     async def _emergency_serialized(self, reason: str = "operator"):
         await self.store.set_status("kill_switch", reason)
         async with self._state_lock:
-            snapshot = replace(self.cycle.trade) if self.cycle.trade else None
-        execution_confirmed = False
-        if snapshot:
+            snapshots = [replace(t) for t in self.cycle.open_trades()]
+        if not self._live:
+            self._running = False
+            return
+        if not snapshots:
+            self._running = False
+            return
+
+        any_failed = False
+        for snapshot in snapshots:
             sig = Signal(
                 action="SELL",
                 symbol=snapshot.symbol,
@@ -2207,54 +2386,46 @@ class GreeksEngine:
                 reason=f"EXIT_EMERGENCY: {reason}",
             )
             execution_confirmed = await self._execute_serialized(sig)
-
-        if not self._live:
-            self._running = False
-            return
-        if not snapshot:
-            # No local option risk to flatten.
-            self._running = False
-            return
-
-        flat, exchange_size = await self._confirm_delta_flat(
-            snapshot.product_id,
-            reads=3,
-            delay_sec=0.8,
-        )
-        if execution_confirmed and flat:
-            async with self._state_lock:
-                trade_remains = bool(self.cycle.trade)
-            if trade_remains:
-                await self._clear_external_flat(
-                    "emergency flatten confirmed by Delta positions"
-                )
-            await self.store.set_status("stopped", f"flat confirmed: {reason}")
-            await self._log(
-                "[EMERGENCY] Delta explicitly confirmed flat — local SoT cleared"
+            flat, exchange_size = await self._confirm_delta_flat(
+                snapshot.product_id,
+                reads=3,
+                delay_sec=0.8,
             )
-            self._running = False
-            return
+            if execution_confirmed and flat:
+                async with self._state_lock:
+                    remains = bool(self.cycle.trade_by_product(snapshot.product_id))
+                if remains:
+                    await self._clear_external_flat(
+                        "emergency flatten confirmed by Delta positions",
+                        product_id=snapshot.product_id,
+                    )
+                continue
+            any_failed = True
+            async with self._state_lock:
+                live = self.cycle.trade_by_product(snapshot.product_id)
+                if not live:
+                    if exchange_size:
+                        snapshot.size = abs(int(exchange_size))
+                    self.cycle.trades[snapshot.underlying.upper()] = snapshot
+                elif exchange_size:
+                    live.size = abs(int(exchange_size))
+                await self.store.save_trade_plan(self.cycle.trade_plan_dict())
+            await self._log(
+                f"[EMERGENCY] flatten NOT confirmed on {snapshot.symbol} — "
+                f"retained; Delta size={exchange_size}"
+            )
 
-        # Flatten was rejected, partial, ambiguous, or Delta still reports size.
-        # Keep/restore local risk so sync and exit management remain alive.
-        async with self._state_lock:
-            if not self.cycle.trade:
-                snapshot.size = (
-                    abs(int(exchange_size)) if exchange_size else snapshot.size
-                )
-                self.cycle.trade = snapshot
-            elif exchange_size:
-                self.cycle.trade.size = abs(int(exchange_size))
-            await self.store.save_trade_plan(self.cycle.trade_plan_dict())
-        await self.store.set_status(
-            "flatten_failed",
-            f"{reason}; exchange_size={exchange_size}; "
-            f"execution_confirmed={execution_confirmed}",
-        )
+        if any_failed:
+            await self.store.set_status(
+                "flatten_failed",
+                f"{reason}; one or more legs not confirmed flat",
+            )
+            return
+        await self.store.set_status("stopped", f"flat confirmed: {reason}")
         await self._log(
-            "[EMERGENCY] flatten NOT confirmed — local SoT retained as active risk; "
-            f"Delta size={exchange_size}"
+            "[EMERGENCY] Delta explicitly confirmed flat — local SoT cleared"
         )
+        self._running = False
 
     async def shutdown(self):
         self._running = False

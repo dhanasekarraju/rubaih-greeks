@@ -16,8 +16,11 @@ trading:
   # Capital survival: small premium per trade
   margin_use_frac: 0.20
   margin_use_max_frac: 0.25
-  # Hard cap — ~15% of a ~34 USDT book; still well under 20% free use
+  # Per-coin premium budget. With two underlyings open, peak exposure ≈ 2× this.
   max_premium_budget_usdt: 5.0
+  # Allow one live option per underlying so a dual BTC+ETH impulse is not dropped.
+  max_open_underlyings: 2
+  one_per_underlying: true
   underlyings:
     - BTC
     - ETH

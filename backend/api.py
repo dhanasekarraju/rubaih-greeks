@@ -176,6 +176,8 @@ async def settings():
         "margin_use_frac": str(t.get("margin_use_frac", 0.20)),
         "margin_use_max_frac": str(t.get("margin_use_max_frac", 0.25)),
         "max_premium_budget_usdt": str(t.get("max_premium_budget_usdt", 5.0)),
+        "max_open_underlyings": str(t.get("max_open_underlyings", 2)),
+        "one_per_underlying": str(bool(t.get("one_per_underlying", True))).lower(),
         "take_profit_premium_pct": str(s.get("take_profit_premium_pct", 0.50)),
         "stop_loss_premium_pct": str(s.get("stop_loss_premium_pct", 0.25)),
         "tp_display": f"Premium +{float(s.get('take_profit_premium_pct', 0.50))*100:.0f}%",
