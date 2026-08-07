@@ -333,13 +333,18 @@ class OptionsCycle:
                     pass
         return OptionsCycle._expiry_ts_from_symbol(symbol)
 
-    def _dte_days(self, row: Dict, symbol: str = "") -> float:
+    def _dte_days(self, row: Dict, symbol: str = "", now: Optional[float] = None) -> float:
+        """`now` defaults to wall-clock time (live behavior). Backtests must
+        pass the historical snapshot timestamp — otherwise DTE is measured
+        against real wall-clock time and the min/max_dte gate breaks on any
+        historical data."""
         ts = self._parse_expiry_ts(row, symbol)
         if not ts:
             return -1.0
-        return max(0.0, (ts - time.time()) / 86400.0)
+        ref = time.time() if now is None else float(now)
+        return max(0.0, (ts - ref) / 86400.0)
 
-    def parse_ticker(self, row: Dict) -> Optional[OptionCandidate]:
+    def parse_ticker(self, row: Dict, now: Optional[float] = None) -> Optional[OptionCandidate]:
         if str(row.get("product_trading_status") or "operational").lower() not in (
             "operational",
             "active",
@@ -383,7 +388,7 @@ class OptionsCycle:
             return None
         mid = (bid + ask) / 2 if bid > 0 and ask > 0 else mark
         spread = abs(ask - bid) / mid if mid > 0 else 1.0
-        dte = self._dte_days(row, symbol)
+        dte = self._dte_days(row, symbol, now=now)
         if dte < 0:
             return None
         delta = _f(greeks.get("delta") or row.get("delta"))
@@ -480,15 +485,20 @@ class OptionsCycle:
         sigs = self.pick_entries(tickers)
         return sigs[0] if sigs else None
 
-    def pick_entries(self, tickers: List[Dict]) -> List[Signal]:
-        """Up to one new entry per free underlying when each clears the gates."""
-        now = time.time()
+    def pick_entries(self, tickers: List[Dict], now: Optional[float] = None) -> List[Signal]:
+        """Up to one new entry per free underlying when each clears the gates.
+
+        `now` defaults to wall-clock time (live behavior). Backtests pass the
+        historical snapshot timestamp so cooldown/interval gating replays
+        exactly as it would have fired live.
+        """
+        now = time.time() if now is None else float(now)
         if self.slots_free() <= 0:
             return []
         cands = []
         spots = {}
         for row in tickers:
-            c = self.parse_ticker(row)
+            c = self.parse_ticker(row, now=now)
             if c:
                 spots[c.underlying] = c.spot
                 cands.append(c)
@@ -550,7 +560,9 @@ class OptionsCycle:
             self._last_signal = now
         return signals
 
-    def arm(self, sig: Signal, fill_premium: Optional[float] = None):
+    def arm(self, sig: Signal, fill_premium: Optional[float] = None, now: Optional[float] = None):
+        """`now` defaults to wall-clock time (live behavior). Backtests pass the
+        historical fill timestamp so hold-time based exits replay correctly."""
         entry = float(fill_premium or sig.premium)
         cval = float(sig.contract_value or 1.0)
         tp = entry * (1.0 + self.tp_pct)
@@ -570,7 +582,7 @@ class OptionsCycle:
             strike=sig.strike,
             size=sig.size,
             entry_premium=entry,
-            entry_ts=time.time(),
+            entry_ts=time.time() if now is None else float(now),
             tp=tp,
             sl=sl,
             r_inr=r,
@@ -668,7 +680,12 @@ class OptionsCycle:
         elif t:
             self.trades["UNK"] = t
 
-    def evaluate_exit(self, mark: float, trade: Optional[OpenTrade] = None) -> Optional[Signal]:
+    def evaluate_exit(
+        self, mark: float, trade: Optional[OpenTrade] = None, now: Optional[float] = None
+    ) -> Optional[Signal]:
+        """`now` defaults to wall-clock time (live behavior). Backtests pass the
+        historical snapshot timestamp so max_hold/trail timing replays exactly
+        as it would have fired live."""
         t = trade if trade is not None else self.trade
         if not t or mark <= 0:
             return None
@@ -684,7 +701,7 @@ class OptionsCycle:
             t.peak_pnl * self.trail_giveback_of_peak if t.peak_pnl > 0 else 0.0,
         )
         max_loss = t.premium_budget * self.max_loss_frac
-        now = time.time()
+        now = time.time() if now is None else float(now)
         if now - self._last_hold_log > 8:
             self._last_hold_log = now
             held = now - t.entry_ts
