@@ -993,6 +993,7 @@ class GreeksEngine:
             2, int(risk_cfg.get("flat_confirm_readings", 2))
         )
         self._entry_blocked = False
+        self._flatten_failed = False
         # Risk is measured on the bot's own curve: allocation + its realised PnL
         # + its open position. Wallet balance is collateral availability only.
         self._bot_base = 0.0
@@ -1026,7 +1027,9 @@ class GreeksEngine:
             auth = await self.client.ping_auth()
         await self._load_halt_state()
         if auth:
-            # Learn the operator's manual inventory before the first entry.
+            # Crash-after-fill orphans: adopt + halt — never silently foreign-exclude
+            await self._adopt_orphan_positions()
+            # Remaining non-bot / short inventory stays excluded
             await self._scan_foreign_positions()
         # Authenticate first: the wallet is only readable once auth is established,
         # and an unauthenticated boot silently falls back to the stale ledger.
@@ -1071,9 +1074,23 @@ class GreeksEngine:
         await self._log("=" * 60)
         if self._live and not auth:
             await self._log("[WARN] LIVE on but Delta auth failed — orders blocked")
-        if self._halted:
+        if self._flatten_failed:
+            await self._log(
+                f"[HALT] flatten_failed restored — entries blocked until "
+                f"POST /api/resume. Reason: {self._halt_reason or 'n/a'}"
+            )
+            await self.store.set_status("flatten_failed", self._halt_reason or "flatten_failed")
+        elif self._halted and self._halt_kind == "kill":
+            await self._log(
+                f"[HALT] Kill switch restored — entries blocked until "
+                f"POST /api/resume. Reason: {self._halt_reason or 'n/a'}"
+            )
+            await self.store.set_status("kill_switch", self._halt_reason or "kill")
+        elif self._halted:
             await self._log(f"[HALT] Active — no new entries. Reason: {self._halt_reason or 'n/a'}")
-        await self.store.set_status("halted" if self._halted else "running")
+            await self.store.set_status("halted", self._halt_reason or "halted")
+        else:
+            await self.store.set_status("running")
         tasks = [
             self.main_loop(),
             self.sync_loop(),
@@ -1210,10 +1227,38 @@ class GreeksEngine:
         self._drawdown_pct = _f(state.get("drawdown_pct"))
         self._halt_ts = _f(state.get("halt_ts"))
         self._halt_kind = str(state.get("halt_kind") or "")
+        self._flatten_failed = bool(state.get("flatten_failed"))
+        kill = bool(state.get("kill"))
+        # Durable operator kill / flatten_failed survive Docker restart
+        if kill or self._halt_kind == "kill":
+            self._halted = True
+            self._halt_kind = "kill"
+            self._entry_blocked = True
+            if not self._halt_reason:
+                self._halt_reason = str(state.get("kill_reason") or "kill switch")
+            if self._halt_ts <= 0:
+                self._halt_ts = _f(state.get("ts")) or time.time()
+            await self.store.set_halted(True, self._halt_reason)
+        if self._flatten_failed:
+            self._entry_blocked = True
+            if not self._halt_reason:
+                self._halt_reason = str(
+                    state.get("kill_reason") or "flatten_failed — confirm flat then resume"
+                )
+        if bool(state.get("entry_blocked")):
+            self._entry_blocked = True
         # Halts persisted before the bot had its own equity curve were computed
         # from wallet balance, which every manual trade moved. Drop them rather
         # than serve a cooldown for a loss the bot never took.
-        if self._halted and (self._halt_ts <= 0 or not self._halt_kind):
+        # Never wipe kill / orphan / flatten_failed this way.
+        sticky = {"kill", "orphan", "ruin"}
+        if (
+            self._halted
+            and (self._halt_ts <= 0 or not self._halt_kind)
+            and self._halt_kind not in sticky
+            and not kill
+            and not self._flatten_failed
+        ):
             await self._clear_halt("halt predates bot-scoped equity curve")
         # Operator retuned bot_allocation_quote (deposit / withdrawal). Adopt it
         # when flat so Redis doesn't keep the old probe-sized base forever.
@@ -1245,6 +1290,14 @@ class GreeksEngine:
                 "drawdown_pct": self._drawdown_pct,
                 "halt_ts": self._halt_ts,
                 "halt_kind": self._halt_kind,
+                "kill": bool(self._halt_kind == "kill"),
+                "kill_reason": (
+                    self._halt_reason
+                    if self._halt_kind in ("kill", "orphan") or self._flatten_failed
+                    else ""
+                ),
+                "flatten_failed": bool(self._flatten_failed),
+                "entry_blocked": bool(self._entry_blocked),
                 "ts": time.time(),
             }
         )
@@ -1429,6 +1482,7 @@ class GreeksEngine:
             self._halt_ts = 0.0
             self._breach_count = 0
             self._entry_blocked = False
+            self._flatten_failed = False
             await self.store.set_halted(False)
             if rebase:
                 # A human explicitly accepted the loss: fold realised PnL into a
@@ -1456,8 +1510,11 @@ class GreeksEngine:
         """
         if not self._halted or not self.cycle.auto_resume:
             return False
-        if self._halt_kind == "ruin":
-            return False  # terminal: needs a human and probably a refund
+        # Terminal / operator / orphan — human must resume
+        if self._halt_kind in ("ruin", "kill", "orphan"):
+            return False
+        if self._flatten_failed:
+            return False
         if self._halt_ts <= 0:
             self._halt_ts = time.time()
             await self._persist_risk_state()
@@ -1535,6 +1592,8 @@ class GreeksEngine:
             "halt_reason": self._halt_reason,
             "drawdown_pct": self._drawdown_pct,
             "halt_kind": self._halt_kind,
+            "flatten_failed": self._flatten_failed,
+            "entry_blocked": self._entry_blocked,
             "risk_block": self._risk_block,
             "bot_base": self._bot_base,
             "bot_realized": self._bot_realized,
@@ -1554,7 +1613,8 @@ class GreeksEngine:
                 self._halted
                 and self.cycle.auto_resume
                 and self._halt_ts > 0
-                and self._halt_kind != "ruin"
+                and self._halt_kind not in ("ruin", "kill", "orphan")
+                and not self._flatten_failed
             )
             else 0.0,
             "ai_enabled": self._ai_enabled,
@@ -1674,6 +1734,126 @@ class GreeksEngine:
                     await rd.delete(flight_key)
         except Exception:
             pass
+
+    async def _adopt_orphan_positions(self):
+        """On boot: unmatched Delta longs on bot underlyings are crash orphans.
+
+        Never silently foreign-exclude them — adopt into the trade plan and
+        durable-halt new entries until an operator resumes. True manual books
+        on other underlyings (or shorts) stay for the foreign guard.
+        """
+        if not (self.client and self.client._auth_ok):
+            return
+        try:
+            positions = await self.client.get_positions()
+        except Exception as exc:
+            await self._log(f"[ORPHAN] position scan failed: {exc}")
+            return
+
+        async with self._state_lock:
+            own = self.cycle.own_product_ids()
+            allowed_u = {u.upper() for u in self.cycle.underlyings}
+
+        adopted: List[str] = []
+        blocked: List[str] = []
+
+        for row in positions or []:
+            product = row.get("product") if isinstance(row.get("product"), dict) else {}
+            pid = int(row.get("product_id") or product.get("id") or 0)
+            size = int(_f(row.get("size") or row.get("position_size")))
+            if not pid or size == 0 or pid in own:
+                continue
+
+            symbol = str(
+                row.get("product_symbol")
+                or row.get("symbol")
+                or product.get("symbol")
+                or ""
+            )
+            underlying = str(
+                row.get("underlying_asset_symbol")
+                or (row.get("underlying_asset") or {}).get("symbol")
+                or product.get("underlying_asset_symbol")
+                or ""
+            ).upper()
+            if not underlying and symbol:
+                parts = symbol.split("-")
+                if len(parts) >= 2:
+                    underlying = parts[1].upper()
+
+            # Shorts / non-bot underlyings → foreign guard only
+            if size < 0 or underlying not in allowed_u:
+                continue
+
+            contract = str(
+                row.get("contract_type") or product.get("contract_type") or ""
+            ).lower()
+            if "put" in contract or symbol.upper().startswith("P-"):
+                opt = "put"
+            else:
+                opt = "call"
+            strike = _f(
+                row.get("strike_price")
+                or product.get("strike_price")
+                or row.get("strike")
+            )
+            entry = _f(
+                row.get("entry_price")
+                or row.get("average_entry_price")
+                or row.get("avg_entry_price")
+                or row.get("mark_price")
+                or product.get("mark_price")
+            )
+            cval = _f(
+                row.get("contract_value") or product.get("contract_value"), 1.0
+            ) or 1.0
+            if entry <= 0:
+                blocked.append(f"{symbol or pid}:no_entry")
+                continue
+
+            async with self._state_lock:
+                if underlying in self.cycle.trades:
+                    blocked.append(f"{symbol}:slot_busy_{underlying}")
+                    continue
+                if self.cycle.slots_free() <= 0:
+                    blocked.append(f"{symbol}:no_slot")
+                    continue
+                sig = Signal(
+                    action="BUY",
+                    symbol=symbol or f"ORPHAN-{pid}",
+                    product_id=pid,
+                    size=abs(int(size)),
+                    premium=entry,
+                    underlying=underlying,
+                    option_type=opt,
+                    strike=strike,
+                    contract_value=cval,
+                    reason=f"ORPHAN_ADOPT: crash/restart unmatched {symbol}",
+                )
+                self.cycle.arm(sig, fill_premium=entry)
+                await self.store.save_trade_plan(self.cycle.trade_plan_dict())
+                own.add(pid)
+                adopted.append(f"{symbol}×{abs(size)}@{entry:.4f}")
+
+        if adopted:
+            await self._log(
+                f"[ORPHAN] adopted into bot plan (will manage exits): {', '.join(adopted)}"
+            )
+        if adopted or blocked:
+            reason = (
+                f"orphan inventory on boot — adopted={len(adopted)} "
+                f"blocked={blocked or 'none'}; POST /api/resume after review"
+            )
+            async with self._state_lock:
+                self._halted = True
+                self._halt_kind = "orphan"
+                self._halt_reason = reason
+                self._halt_ts = time.time()
+                self._entry_blocked = True
+            await self.store.set_halted(True, reason)
+            await self._persist_risk_state()
+            await self.store.set_status("halted", reason)
+            await self._log(f"[ORPHAN] durable halt — {reason}")
 
     async def _scan_foreign_positions(self):
         """Record Delta positions this bot did not open.
@@ -2055,13 +2235,20 @@ class GreeksEngine:
                             0.0,
                             self.cycle.halt_cooldown_sec - (time.time() - self._halt_ts),
                         )
+                        sticky = self._halt_kind in ("ruin", "kill", "orphan") or self._flatten_failed
                         when = (
                             f"auto-resume in {left / 60:.0f}m"
-                            if self.cycle.auto_resume
+                            if self.cycle.auto_resume and not sticky
                             else "POST /api/resume to clear"
                         )
                         await self._log(
                             f"[HALT] blocked entries — {self._halt_reason or 'risk'} ({when})"
+                        )
+                elif self._entry_blocked or self._flatten_failed:
+                    if int(time.time()) % 90 < 3:
+                        await self._log(
+                            f"[HALT] entry_blocked flatten_failed={self._flatten_failed} "
+                            f"— POST /api/resume after inventory is safe"
                         )
                 elif self._risk_block:
                     if int(time.time()) % 90 < 3:
@@ -2347,7 +2534,7 @@ class GreeksEngine:
                     if decision.action == "EMERGENCY" and decision.confidence > 0.95:
                         await self._log(f"[AI] EMERGENCY: {decision.reasoning}")
                         await self._emergency(f"AI_EMERGENCY: {decision.reasoning}")
-                        break
+                        continue
             except Exception as e:
                 await self._log(f"[AI LOOP] {e}")
             await asyncio.sleep(180)
@@ -2359,14 +2546,29 @@ class GreeksEngine:
             await self._emergency_serialized(reason)
 
     async def _emergency_serialized(self, reason: str = "operator"):
-        await self.store.set_status("kill_switch", reason)
+        """Flatten open legs and durable-kill. Never exit the process.
+
+        Docker restart: unless-stopped must not silently resume trading.
+        """
+        halt_reason = f"KILL: {reason}"
         async with self._state_lock:
+            self._entry_blocked = True
+            self._halted = True
+            self._halt_kind = "kill"
+            self._halt_reason = halt_reason
+            self._halt_ts = time.time()
+            self._flatten_failed = False
             snapshots = [replace(t) for t in self.cycle.open_trades()]
-        if not self._live:
-            self._running = False
-            return
-        if not snapshots:
-            self._running = False
+        await self.store.set_halted(True, halt_reason)
+        await self._persist_risk_state()
+        await self.store.set_status("kill_switch", reason)
+
+        if not self._live or not snapshots:
+            await self._log(
+                f"[EMERGENCY] kill persisted ({reason}) — "
+                f"{'no open legs' if not snapshots else 'dry-run'}; "
+                f"entries blocked until POST /api/resume"
+            )
             return
 
         any_failed = False
@@ -2416,16 +2618,28 @@ class GreeksEngine:
             )
 
         if any_failed:
+            async with self._state_lock:
+                self._flatten_failed = True
+                self._entry_blocked = True
+                self._halted = True
+                self._halt_kind = "kill"
+                self._halt_reason = f"{halt_reason}; flatten_failed"
+            await self._persist_risk_state()
             await self.store.set_status(
                 "flatten_failed",
                 f"{reason}; one or more legs not confirmed flat",
             )
+            await self._log(
+                "[EMERGENCY] flatten_failed persisted — process stays up; "
+                "entries blocked until flat + POST /api/resume"
+            )
             return
-        await self.store.set_status("stopped", f"flat confirmed: {reason}")
+
+        await self._persist_risk_state()
+        await self.store.set_status("kill_switch", f"flat confirmed: {reason}")
         await self._log(
-            "[EMERGENCY] Delta explicitly confirmed flat — local SoT cleared"
+            "[EMERGENCY] Delta confirmed flat — kill remains until POST /api/resume"
         )
-        self._running = False
 
     async def shutdown(self):
         self._running = False

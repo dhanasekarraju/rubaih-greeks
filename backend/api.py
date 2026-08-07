@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Dict, Optional
@@ -299,6 +300,26 @@ async def get_balance():
     }
 
 
+async def _merge_risk_state(**fields: Any) -> Dict[str, Any]:
+    """Dual-write kill/halt durability even if the engine is down / misses the queue."""
+    if not rd:
+        return {}
+    state: Dict[str, Any] = {}
+    try:
+        raw = await rd.get("greeks:risk_state")
+        if raw:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                state = parsed
+    except Exception:
+        state = {}
+    state.update({k: v for k, v in fields.items() if v is not None})
+    if "ts" not in fields:
+        state["ts"] = time.time()
+    await rd.set("greeks:risk_state", json.dumps(state))
+    return state
+
+
 async def _queue_command(command: str):
     if not rd:
         raise HTTPException(status_code=503, detail="redis unavailable")
@@ -308,8 +329,24 @@ async def _queue_command(command: str):
 
 @app.post("/api/kill", dependencies=[Depends(require_token)])
 async def kill():
+    reason = "API_KILL from authenticated_api"
+    # Persist BEFORE queue so Docker restart / down engine cannot miss the halt
+    await rd.set("greeks:halted", "1")
+    await rd.set(
+        "greeks:halt_reason",
+        json.dumps({"reason": reason, "ts": time.time()}),
+    )
+    await rd.set("greeks:engine_status", "kill_switch")
+    await _merge_risk_state(
+        kill=True,
+        halt_kind="kill",
+        halt_ts=time.time(),
+        entry_blocked=True,
+        flatten_failed=False,
+        kill_reason=reason,
+    )
     await _queue_command("kill")
-    return {"ok": True, "queued": "kill"}
+    return {"ok": True, "queued": "kill", "persisted": True}
 
 
 @app.post("/api/refresh-capital", dependencies=[Depends(require_token)])
@@ -320,9 +357,19 @@ async def refresh_capital():
 
 @app.post("/api/resume", dependencies=[Depends(require_token)])
 async def resume():
-    """Clear risk halt so the engine may enter again (resets DD baseline)."""
+    """Clear durable kill/halt/flatten_failed so the engine may enter again."""
+    await rd.delete("greeks:halted")
+    await rd.delete("greeks:halt_reason")
+    await _merge_risk_state(
+        kill=False,
+        halt_kind="",
+        halt_ts=0.0,
+        entry_blocked=False,
+        flatten_failed=False,
+        kill_reason="",
+    )
     await _queue_command("resume")
-    return {"ok": True, "queued": "resume"}
+    return {"ok": True, "queued": "resume", "persisted": True}
 
 
 @app.post("/api/sync-positions", dependencies=[Depends(require_token)])
