@@ -1,0 +1,28 @@
+name: Rubaih Greeks safety tests
+
+on:
+  push:
+    branches:
+      - "fix/rubaih-greeks-safety-hardening-20261013"
+  pull_request:
+    paths:
+      - "backend/**"
+      - ".github/workflows/greeks-safety-tests.yml"
+
+jobs:
+  safety-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install engine dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Compile Python code
+        run: python -m compileall -q .
+      - name: Safety regression tests
+        run: python -m unittest discover -s tests -v
