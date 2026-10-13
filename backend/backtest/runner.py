@@ -145,9 +145,10 @@ class BacktestRunner:
     def _current_mark(self, trade: OpenTrade, ts: float, by_symbol: Dict) -> Optional[float]:
         c = by_symbol.get(trade.symbol)
         if c is not None:
-            self._last_mark[trade.symbol] = c.mark
+            # Real-paper execution can sell at bid, not the theoretical mark.
+            self._last_mark[trade.symbol] = c.bid
             self._stale_count[trade.symbol] = 0
-            return c.mark
+            return c.bid
         if self.reprice_fn is not None:
             spot = self._current_spots.get(trade.underlying)
             expiry_ts = (self._entry_meta.get(trade.symbol) or {}).get("expiry_ts")
@@ -160,9 +161,10 @@ class BacktestRunner:
         # exit if it's been stale too long instead of silently riding a
         # position we have no real price for.
         self._stale_count[trade.symbol] = self._stale_count.get(trade.symbol, 0) + 1
-        if self._stale_count[trade.symbol] > self.max_stale_snapshots:
-            return self._last_mark.get(trade.symbol)
-        return self._last_mark.get(trade.symbol)
+        # Stale prices cannot establish an executable exit. Never pretend a
+        # carried-forward mark is a fresh bid; retain the open trade and expose
+        # the unresolved state for an operator/replay integrity check.
+        return None
 
     # ------------------------------------------------------------------
     def _fill_entry(self, sig: Signal, ts: float, by_symbol: Dict) -> None:
