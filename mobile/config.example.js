@@ -3,7 +3,8 @@
  * config.js is gitignored (contains token).
  */
 
-export const DEFAULT_API_HOST = 'http://103.194.228.130:8088';
+// Set a trusted HTTPS gateway in private config.js for remote mobile access.
+export const DEFAULT_API_HOST = 'https://YOUR_GREEKS_DOMAIN';
 export const DEFAULT_API_TOKEN = 'REPLACE_WITH_RUBAIH_GREEKS_API_TOKEN';
 
 export function normalizeHost(host) {
