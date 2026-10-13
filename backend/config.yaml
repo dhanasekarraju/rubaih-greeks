@@ -30,6 +30,8 @@ trading:
   strategy:
     entry_cooldown_sec: 180
     momentum_lookback: 20
+    # 3-second buckets match the original scan cadence; stable under retries/bursts.
+    momentum_sample_sec: 3
     # Was 0.3% — too quiet for small-book probe
     entry_move_pct: 0.0015
     # DTE uses 12:00 UTC expiry. Allow 1–7d so weeklies are reachable.

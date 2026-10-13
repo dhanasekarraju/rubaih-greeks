@@ -136,6 +136,8 @@ class OptionsCycle:
         self.min_interval = float(t.get("min_entry_interval_sec", 120))
         self.entry_cooldown = float(s.get("entry_cooldown_sec", 180))
         self.lookback = int(s.get("momentum_lookback", 20))
+        # Fixed-size timestamp buckets, not one observation per HTTP poll.
+        self.momentum_sample_sec = max(1.0, float(s.get("momentum_sample_sec", 3)))
         self.entry_move_pct = float(s.get("entry_move_pct", 0.0015))
         self.min_dte = float(s.get("min_dte_days", 1))
         self.max_dte = float(s.get("max_dte_days", 7))
@@ -171,6 +173,7 @@ class OptionsCycle:
         # or reconcile against positions it did not open.
         self.excluded_pids: Set[int] = set()
         self._spot_hist: Dict[str, List[float]] = {u: [] for u in self.underlyings}
+        self._spot_bucket: Dict[str, int] = {}
         self._last_signal = 0.0
         self._last_signal_by_u: Dict[str, float] = {}
         self._last_hold_log = 0.0
@@ -253,8 +256,8 @@ class OptionsCycle:
         caps = [self.budget_for(u) for u in self.underlyings]
         return max(caps) if caps else 0.0
 
-    def budget_for(self, underlying: str) -> float:
-        """Per-coin premium budget. Empty slot → up to max_premium_budget of free."""
+    def budget_for(self, underlying: str, reserved_quote: float = 0.0) -> float:
+        """Fee-inclusive admission budget after reserving other signals and free floor."""
         u = (underlying or "").upper()
         if not u:
             return 0.0
@@ -262,11 +265,12 @@ class OptionsCycle:
             return 0.0
         if self.slots_free() <= 0:
             return 0.0
-        free = max(self.free_capital_quote, 0.0)
+        free = max(0.0, self.free_capital_quote - max(0.0, reserved_quote)
+                   - self.min_free_quote)
+        fraction = max(0.0, min(self.margin_use_frac, self.margin_use_max_frac))
+        fractional_cap = free * fraction
         cap = float(self.max_premium_budget or 0.0)
-        if cap <= 0:
-            return free
-        return min(free, cap)
+        return min(free, fractional_cap, cap) if cap > 0 else min(free, fractional_cap)
 
     def size_contracts(self, unit_cost: float, budget: Optional[float] = None) -> int:
         """Integer contracts whose premium notional fits budget."""
@@ -276,11 +280,24 @@ class OptionsCycle:
         n = int(math.floor(b / unit_cost))
         return max(0, n)
 
-    def note_spot(self, underlying: str, spot: float):
-        if spot <= 0:
+    def note_spot(self, underlying: str, spot: float, now: Optional[float] = None):
+        """One observation per fixed bucket; never turn bursty polling into momentum."""
+        if spot <= 0 or not math.isfinite(spot):
             return
         u = underlying.upper()
+        bucket = int((time.time() if now is None else float(now))
+                     // self.momentum_sample_sec)
         hist = self._spot_hist.setdefault(u, [])
+        previous = self._spot_bucket.get(u)
+        if previous is not None and bucket < previous:
+            return  # replay with out-of-order timestamps must not mutate history
+        if previous == bucket:
+            if hist:
+                hist[-1] = spot
+            return
+        if previous is not None and bucket - previous > 4:
+            hist.clear()  # never span an outage with a misleading short-window signal
+        self._spot_bucket[u] = bucket
         hist.append(spot)
         if len(hist) > self.lookback * 3:
             del hist[: len(hist) - self.lookback * 3]
@@ -375,8 +392,12 @@ class OptionsCycle:
         if underlying not in self.underlyings:
             return None
         mark = _f(row.get("mark_price") or row.get("close"))
-        bid = _f(quotes.get("best_bid") or mark)
-        ask = _f(quotes.get("best_ask") or mark)
+        bid = _f(quotes.get("best_bid"))
+        ask = _f(quotes.get("best_ask"))
+        # A mark is not an executable quote: missing, crossed or empty books
+        # must never qualify for a buy (nor invent a backtest fill).
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return None
         spot = _f(row.get("spot_price") or greeks.get("spot"))
         strike = _f(row.get("strike_price") or product.get("strike_price"))
         pid = int(row.get("product_id") or product.get("id") or 0)
@@ -391,7 +412,14 @@ class OptionsCycle:
         dte = self._dte_days(row, symbol, now=now)
         if dte < 0:
             return None
-        delta = _f(greeks.get("delta") or row.get("delta"))
+        raw_delta = greeks.get("delta")
+        if raw_delta is None:
+            raw_delta = row.get("delta")
+        delta = _f(raw_delta)
+        if not (-1.0 <= delta <= 1.0) or delta == 0:
+            return None
+        if (otype == "call" and delta <= 0) or (otype == "put" and delta >= 0):
+            return None
         return OptionCandidate(
             symbol=symbol,
             product_id=pid,
@@ -503,7 +531,7 @@ class OptionsCycle:
                 spots[c.underlying] = c.spot
                 cands.append(c)
         for u, spot in spots.items():
-            self.note_spot(u, spot)
+            self.note_spot(u, spot, now=now)
         ranked = self.filter_rank(cands)
         if not ranked:
             return []
@@ -512,6 +540,7 @@ class OptionsCycle:
         open_us = set(self.trades.keys())
         signals: List[Signal] = []
         taken_us: Set[str] = set()
+        reserved_quote = 0.0
         # Walk score order; take at most one contract per free underlying.
         for c in ranked:
             if len(signals) >= self.slots_free():
@@ -524,16 +553,18 @@ class OptionsCycle:
             last_u = self._last_signal_by_u.get(u, 0.0)
             if now - last_u < cooldown:
                 continue
-            budget = self.budget_for(u)
+            budget = self.budget_for(u, reserved_quote=reserved_quote)
             if budget <= 0:
                 continue
             px = c.ask if c.ask > 0 else c.mark
             unit_cost = px * c.contract_value
             if unit_cost <= 0 or unit_cost > budget * 1.01:
                 continue
-            size = self.size_contracts(unit_cost, budget)
+            # Include estimated entry fees in the reservation.
+            size = self.size_contracts(unit_cost, budget / (1.0 + self.fee_rate))
             if size < 1:
                 continue
+            reserved_quote += size * unit_cost * (1.0 + self.fee_rate)
             mom = self.momentum(u)
             signals.append(
                 Signal(
@@ -1022,6 +1053,25 @@ class GreeksEngine:
         self._risk_block = ""
         # Product ids Delta reports that this bot did not open.
         self._foreign_pids: Set[int] = set()
+
+    def _buy_reject_reason(self, sig: Signal) -> str:
+        """Final admission under the order lock; catches stale queued signals."""
+        if not self._running or self._halted or self._entry_blocked or self._flatten_failed:
+            return "engine halted/stopping"
+        if self._risk_block:
+            return self._risk_block
+        u = (sig.underlying or "").upper()
+        if not u or u not in self.cycle.underlyings:
+            return "unknown underlying"
+        if self.cycle.trade_for(u) or self.cycle.slots_free() < 1:
+            return "underlying occupied / no slot"
+        if sig.size < 1 or sig.premium <= 0 or sig.contract_value <= 0:
+            return "invalid size or premium"
+        cost_with_fee = (sig.size * sig.premium * sig.contract_value
+                         * (1.0 + self.cycle.fee_rate))
+        if cost_with_fee > self.cycle.budget_for(u) + 1e-8:
+            return "stale/excessive size or insufficient fee-inclusive balance"
+        return ""
 
     async def _log(self, line: str):
         print(line)
@@ -1944,14 +1994,18 @@ class GreeksEngine:
 
     async def _execute_serialized(self, sig: Signal) -> bool:
         await self._log(f"[SIGNAL] {sig.reason}")
-        if sig.action == "BUY" and (
-            not self._running or self._halted or self._entry_blocked
-        ):
-            await self._log("[ORDER] BUY blocked — engine halted/stopping")
+        # LIVE_TRADING is a strict execution mode. A missing/unhealthy Delta
+        # session MUST NOT silently become a successful simulated fill.
+        if self._live and not (self.client and self.client._auth_ok):
+            await self._log("[ORDER] LIVE auth unavailable — blocked, not paper-filled")
             return False
-        if sig.action == "BUY" and self.cycle.allow_sell_premium is False:
-            pass  # buy path only
-        live_ok = self._live and self.client and self.client._auth_ok
+        if sig.action == "BUY":
+            async with self._state_lock:
+                reject = self._buy_reject_reason(sig)
+            if reject:
+                await self._log(f"[ORDER] BUY blocked — {reject}")
+                return False
+        live_ok = self._live
         fill_px = sig.premium
         filled_size = int(sig.size)
         actual_fee: Optional[float] = None
@@ -2217,12 +2271,17 @@ class GreeksEngine:
                     try:
                         tk = await self.client.get_ticker(sym)
                         if tk:
-                            mark = _f(
-                                tk.get("mark_price")
-                                or (tk.get("quotes") or {}).get("mark_price")
-                            )
-                            if mark > 0:
-                                self._mark_cache[sym] = mark
+                            quotes = tk.get("quotes") or {}
+                            bid = _f(quotes.get("best_bid"))
+                            ask = _f(quotes.get("best_ask"))
+                            if bid <= 0 or ask <= 0 or ask < bid:
+                                await self._log(
+                                    f"[QUOTE] {sym}: no valid executable bid/ask — skip exit pricing"
+                                )
+                                continue
+                            # Exit triggers and risk valuation use the sellable BID,
+                            # never a mark that may sit above the executable book.
+                            self._mark_cache[sym] = bid
                             g = tk.get("greeks") or {}
                             dlt = _f(g.get("delta") or tk.get("delta"))
                             if dlt != 0:
@@ -2232,10 +2291,7 @@ class GreeksEngine:
                                 live = self.cycle.trade_by_symbol(sym)
                                 if live:
                                     exit_sig = self.cycle.evaluate_exit(
-                                        mark
-                                        if mark > 0
-                                        else self._mark_cache.get(sym, 0),
-                                        trade=live,
+                                        bid, trade=live,
                                     )
                                     await self.store.save_trade_plan(
                                         self.cycle.trade_plan_dict()
@@ -2549,9 +2605,12 @@ class GreeksEngine:
                     )
                     await self._publish()
                     if decision.action == "EMERGENCY" and decision.confidence > 0.95:
-                        await self._log(f"[AI] EMERGENCY: {decision.reasoning}")
-                        await self._emergency(f"AI_EMERGENCY: {decision.reasoning}")
-                        continue
+                        # AI is untrusted advisory output, never an automated
+                        # flatten permission. The operator kill API remains authoritative.
+                        await self._log(
+                            f"[AI] EMERGENCY ADVISORY (manual review required): "
+                            f"{decision.reasoning}"
+                        )
             except Exception as e:
                 await self._log(f"[AI LOOP] {e}")
             await asyncio.sleep(180)
