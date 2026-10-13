@@ -4,6 +4,7 @@ import sys
 import time
 import unittest
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import yaml
@@ -14,14 +15,14 @@ CFG = yaml.safe_load((Path(__file__).resolve().parents[1] / "config.yaml").read_
 
 def candidate(symbol="C-BTC-65000-201026", underlying="BTC", side="call",
               bid=1.0, ask=1.02, delta=0.4):
-    now = time.time()
+    expiry = (datetime.now(timezone.utc) + timedelta(days=3)).isoformat()
     return {
         "symbol": symbol, "product_id": 123, "contract_type": side,
         "underlying_asset_symbol": underlying, "strike_price": 65000,
         "spot_price": 65000, "contract_value": 1,
         "mark_price": 1.01, "quotes": {"best_bid": bid, "best_ask": ask},
         "greeks": {"delta": delta},
-        "expiry_time": "2026-10-20T12:00:00Z",
+        "expiry_time": expiry,
     }
 
 
@@ -53,7 +54,8 @@ class AdmissionTests(unittest.TestCase):
         budget = self.cycle.budget_for("BTC")
         self.assertGreater(budget, 0)
         self.assertLessEqual(budget, 5.0)
-        self.assertLess(self.cycle.budget_for("ETH", reserved_quote=5), budget)
+        self.assertLess(self.cycle.budget_for("ETH", reserved_quote=10), budget)
+        self.assertLessEqual(self.cycle.budget_for("ETH", reserved_quote=100), 0)
 
     def test_final_admission_rejects_bad_cost_and_duplicate_underlying(self):
         eng = GreeksEngine()
@@ -80,6 +82,25 @@ class AdmissionTests(unittest.TestCase):
                      premium=1, underlying="BTC", option_type="call",
                      strike=65000, contract_value=1)
         self.assertIn("halted", eng._buy_reject_reason(sig))
+
+    def test_live_mode_never_falls_back_to_paper(self):
+        import asyncio
+
+        async def execute():
+            eng = GreeksEngine()
+            eng._live = True
+            eng.client = None  # Missing credentials / unavailable exchange
+            eng.cycle.set_free_capital(34.0)
+            sig = Signal(action="BUY", symbol="C-BTC-65000-201026",
+                         product_id=123, size=1, reason="test",
+                         premium=1, underlying="BTC", option_type="call",
+                         strike=65000, contract_value=1)
+            result = await eng._execute_serialized(sig)
+            self.assertFalse(result)
+            self.assertEqual(eng.cycle.slots_open(), 0)
+            self.assertEqual(eng.cycle.free_capital_quote, 34.0)
+
+        asyncio.run(execute())
 
 
 if __name__ == "__main__":
